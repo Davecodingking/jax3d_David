@@ -1,0 +1,3 @@
+# kubric-nightly  # Create freeze
+scikit-image
+pypng

@@ -1,0 +1,20 @@
+chex
+clu
+einops
+flax
+gin-config
+imageio
+jax[cpu]
+mediapy
+numpy
+pandas
+simple_parsing
+tensorflow
+tfds-nightly
+typing_extensions
+xmanager
+
+# Install etils from head
+# Note: Each sub-modules deps should be installed individually
+sunds @ git+https://github.com/google-research/sunds
+etils[array_types,enp,epath,epy,etqdm,etree] @ git+https://github.com/google/etils
