@@ -108,11 +108,12 @@ if scene_type=="synthetic":
       pool.join()
 
     images = np.stack(images, axis=0)
-    if white_bkgd:
-      images = (images[..., :3] * images[..., -1:] + (1. - images[..., -1:]))
-    else:
-      images = images[..., :3] * images[..., -1:]
-
+    # if white_bkgd:
+    #   images = (images[..., :3] * images[..., -1:] + (1. - images[..., -1:]))
+    # else:
+    #   images = images[..., :3] * images[..., -1:]
+    images = images[..., :3] 
+    
     h, w = images.shape[1:3]
     camera_angle_x = float(meta["camera_angle_x"])
     focal = .5 * w / np.tan(.5 * camera_angle_x)

@@ -1,0 +1,133 @@
+这份文档详细整理了截至 **2026年1月11日** 的项目全貌。
+你可以直接将此文档保存为 Markdown (`Project_Summary.md`) 或 PDF，发送给教授，或者直接粘贴给下一个 AI 对话窗口，它包含了所有上下文，能够无缝衔接工作。
+
+---
+
+# 📂 MobileNeRF 移动端游戏管线 - 项目交接与进度报告
+
+**项目名称**：Game Neural Rendering (Sponza HDRP to MobileNeRF)
+**当前阶段**：Stage 1 (Grid Optimization) 完成，Stage 2 (Mesh Extraction) 启动中
+**核心目标**：将 Unity HDRP 高画质场景（Sponza）烘焙为 MobileNeRF 神经资产，在移动端实现 60FPS+ 的照片级渲染。
+
+---
+
+## 1. 核心成就与当前状态 (Executive Summary)
+
+截至目前，我们已攻克了自定义大场景训练中最棘手的**数据格式**与**空间裁切**问题。
+
+* **状态**：Stage 1 训练已收敛。
+* **指标**：**PSNR: 32.97** / **SSIM: 0.888** (极佳，已达到照片级标准)。
+* **结论**：管线已跑通，神经网络成功学习到了 Sponza 复杂的几何结构与光照，未出现伪影或破损。
+
+---
+
+## 2. 技术栈与环境配置 (Tech Stack)
+
+### A. 训练环境 (Colab Pro+ / Local VS Code)
+
+* **代码仓库**：[GitHub - jax3d_David](https://github.com/Davecodingking/jax3d_David.git) (已包含所有修复补丁)
+* **硬件**：NVIDIA A100 / T4
+* **Python 环境**：Python 3.9 (Conda)
+* **关键依赖**：
+* `jax==0.3.25` (CUDA 11)
+* `flax==0.5.3`
+* `numpy==1.23.5`
+
+
+
+### B. 数据来源 (Unity HDRP)
+
+* **场景**：Sponza (修改版，含 41 个实时光源，Deferred Rendering)。
+* **空间参数**：最大半径约 **20米** (长36m x 宽20m x 高18m)。
+* **数据格式**：
+* 图片：800x800 RGB PNG (ACES Tonemapped)。
+* 姿态：OpenGL 坐标系 (Right-Hand, Y-Up)，相机高度 1.5m。
+
+
+
+---
+
+## 3. 关键问题修复记录 (Critical Bug Fixes)
+
+我们在调试过程中解决了两个导致训练失败的致命问题，相关修复**已永久写入 GitHub 仓库源码**。
+
+### ✅ 问题一：训练预览图“泛白/蒙纱” (Whitish Foggy Preview)
+
+* **现象**：GT 和训练结果看起来像蒙了一层厚厚的白纱，亮度异常，丢失纹理细节。
+* **根因**：MobileNeRF 源码默认读取 4 通道图片 (RGBA)。Unity 输出的是 3 通道 (RGB)。代码错误地将**蓝色通道 (Blue Channel)** 当作了 **透明度 (Alpha)**，执行了错误的背景混合算法 (`RGB * Blue + White * (1-Blue)`)。
+* **修复**：修改 `stage1.py` 的数据加载器，强制只读取前 3 个通道。
+* *代码位置*：`load_blender` 函数。
+* *补丁*：`images = images[..., :3] # Force RGB`。
+
+
+
+### ✅ 问题二：大场景被剔除，只有中心可见 (Scene Culling)
+
+* **现象**：训练结果中，只有场景中心的一小块模糊区域，周围 90% 的墙壁和走廊消失（显示为白色背景）。
+* **根因**：
+1. **Scale 过大**：原 Scale 设为 0.05 ()。墙壁刚好落在  的边界上，触发了三线性插值的“死区”，导致被剔除。
+2. **参数失效**：源码中 `load_blender` 函数**未编写**应用外部 `Config.scale` 参数的逻辑，导致参数无效。
+
+
+* **修复**：
+1. **调整 Scale**：引入安全系数，将 Scale 降为 **0.033** ()，确保所有物体落在  的绝对安全区。
+2. **代码注入**：在源码中硬编码了缩放逻辑。
+
+
+* *代码位置*：`stage1.py` 中 `load_blender` 返回前。
+* *补丁*：`poses = poses.at[:, :3, 3].set(poses[:, :3, 3] * 0.033)`。
+
+
+
+---
+
+## 4. 标准化工作流 (Standard Workflow)
+
+为了避免每次 Colab 重连都要重新配置，我们确立了 **"GitHub + Drive"** 混合工作流。
+
+### 步骤 A：本地代码修改 (VS Code)
+
+1. 在本地打开 `jax3d_David` 文件夹。
+2. 修改代码 -> Commit -> Push 到 GitHub。
+
+### 步骤 B：Colab 一键启动 (Start Session)
+
+每次重连 Colab，只需上传数据包 `MyNeRFData.zip`，然后运行以下脚本：
+
+```python
+# 启动脚本：安装环境 + 拉取 GitHub 代码 + 解压数据
+# (代码太长略，直接引用 Start_Next_Session_Final.ipynb)
+# 核心逻辑：
+# 1. pip install jax==0.3.25 ...
+# 2. git clone https://github.com/Davecodingking/jax3d_David.git
+# 3. unzip MyNeRFData.zip
+
+```
+
+### 步骤 C：Stage 2 提取 Mesh (当前任务)
+
+Stage 1 完成后，直接运行 Stage 2。它会自动加载 Stage 1 的 Checkpoints。
+
+---
+
+## 6. 下一步计划 (Next Actions)
+
+1. **运行 Stage 2**：
+* 目标：将 8D 特征网格转化为显式的 `.obj` 模型。
+* 观察：关注 `s2_xxx_rgb.png`，确保网格化后的 Sponza 依然清晰，没有破洞。
+
+
+2. **运行 Stage 3**：
+* 目标：导出最终的纹理图集 (Texture Atlas) 和 GLB/OBJ 文件。
+
+
+3. **真机测试**：
+* 将导出的模型放入 Unity 手机工程，使用 MobileNeRF Shader 进行渲染，测试帧率。
+
+
+
+---
+
+**给 AI 的指令 (Prompt for Next Session):**
+
+> "我们已经完成了 MobileNeRF 的 Stage 1 训练，PSNR 达到 32.9。代码库已托管在 GitHub (jax3d_David)，且修复了 RGB 加载和 Scale (0.033) 的问题。现在请帮我监控 Stage 2 的 Mesh 提取过程，并指导我如何进行 Stage 3 的导出。"
