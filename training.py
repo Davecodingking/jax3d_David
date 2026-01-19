@@ -633,3 +633,90 @@ if os.path.exists(LOCAL_S3_OBJ_SAVE):
         os.system(f"cp -r '{phone_src}/.' '{phone_dst}/'")
 
 print(f"\n✅ 全部完成！高精度 Sponza 已保存至: {DRIVE_FINAL_EXPORT}")
+
+"""# Cell 8: Mesh-Based UV Preprocessing (预计算 像素→UV 映射)"""
+
+import os
+from google.colab import drive
+from IPython import get_ipython
+
+PROJECT_ROOT = "/content/jax3d/jax3d/projects/mobilenerf"
+UV_OUTPUT = os.path.join(PROJECT_ROOT, "data/custom/MyNeRFData/mesh_uv_samples.npz")
+DRIVE_TEXTURE_EXPORT = "/content/drive/MyDrive/Stage1_12Jan/TextureTraining"
+
+print("🚚 [1/3] 准备环境并挂载 Drive...")
+if not os.path.exists("/content/drive"):
+    drive.mount("/content/drive")
+
+if os.path.exists(PROJECT_ROOT):
+    os.chdir(PROJECT_ROOT)
+    os.environ["PYTHONPATH"] += ":/content/jax3d"
+else:
+    print(f"❌ 找不到项目目录: {PROJECT_ROOT}")
+
+print("🔧 [2/3] 预计算 像素→UV 映射 (preprocess_mesh_uv.py)...")
+cmd = "source activate mobilenerf && export MPLBACKEND=Agg && python preprocess_mesh_uv.py"
+get_ipython().system(cmd)
+
+if os.path.exists(UV_OUTPUT):
+    print(f"   ✅ 已生成 UV 采样文件: {UV_OUTPUT}")
+else:
+    print("   ⚠️ 未在预期路径找到 mesh_uv_samples.npz，请检查上方日志输出。")
+
+print("📦 [3/3] 备份 UV 采样文件到 Drive...")
+if not os.path.exists(DRIVE_TEXTURE_EXPORT):
+    os.makedirs(DRIVE_TEXTURE_EXPORT)
+
+uv_dst = os.path.join(DRIVE_TEXTURE_EXPORT, "uv_samples")
+if not os.path.exists(uv_dst):
+    os.makedirs(uv_dst)
+
+if os.path.exists(UV_OUTPUT):
+    os.system(f"cp '{UV_OUTPUT}' '{uv_dst}/'")
+
+print(f"🎉 UV 预处理完成，结果已备份至: {uv_dst}")
+
+"""# Cell 9: Mesh-Based Neural Texture Training (训练特征纹理 + 预览导出)"""
+
+import os
+from google.colab import drive
+from IPython import get_ipython
+
+PROJECT_ROOT = "/content/jax3d/jax3d/projects/mobilenerf"
+DRIVE_TEXTURE_EXPORT = "/content/drive/MyDrive/Stage1_12Jan/TextureTraining"
+
+print("🚚 [1/3] 准备环境并挂载 Drive...")
+if not os.path.exists("/content/drive"):
+    drive.mount("/content/drive")
+
+if os.path.exists(PROJECT_ROOT):
+    os.chdir(PROJECT_ROOT)
+    os.environ["PYTHONPATH"] += ":/content/jax3d"
+else:
+    print(f"❌ 找不到项目目录: {PROJECT_ROOT}")
+
+print("🚀 [2/3] 正在训练特征纹理 (train_texture.py)...")
+cmd = "source activate mobilenerf && export MPLBACKEND=Agg && python train_texture.py"
+get_ipython().system(cmd)
+
+TEXTURES_DIR = os.path.join(PROJECT_ROOT, "textures")
+WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "weights_texture")
+
+print("📦 [3/3] 备份纹理、权重与预览图到 Drive...")
+if not os.path.exists(DRIVE_TEXTURE_EXPORT):
+    os.makedirs(DRIVE_TEXTURE_EXPORT)
+
+textures_dst = os.path.join(DRIVE_TEXTURE_EXPORT, "textures")
+weights_dst = os.path.join(DRIVE_TEXTURE_EXPORT, "weights")
+
+if os.path.exists(TEXTURES_DIR):
+    if not os.path.exists(textures_dst):
+        os.makedirs(textures_dst)
+    os.system(f"cp -r '{TEXTURES_DIR}/.' '{textures_dst}/'")
+
+if os.path.exists(WEIGHTS_DIR):
+    if not os.path.exists(weights_dst):
+        os.makedirs(weights_dst)
+    os.system(f"cp -r '{WEIGHTS_DIR}/.' '{weights_dst}/'")
+
+print(f"🎉 Mesh-Based Neural Texture 训练完成，纹理、权重与预览图已备份至: {DRIVE_TEXTURE_EXPORT}")
