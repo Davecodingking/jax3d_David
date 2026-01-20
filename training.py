@@ -26,6 +26,7 @@ print("✅ Conda 安装完成！正在配置 Python 3.9 环境...")
 !source activate mobilenerf && pip install "flax==0.5.3" scipy "optax==0.1.4" "chex==0.1.5" "absl-py" --no-deps
 # 安装其他工具
 !source activate mobilenerf && pip install tqdm opencv-python-headless matplotlib gin-config msgpack typing-extensions opt_einsum toolz rich PyYAML numpy==1.23.5
+!source activate mobilenerf && pip install torch torchvision torchaudio pytorch3d
 
 # 下载代码
 if not os.path.exists('/content/jax3d'):
@@ -61,6 +62,7 @@ print("✅ Conda 就绪！配置 Python 3.9 + JAX...")
 !source activate mobilenerf && pip install "jax[cuda11_pip]==0.3.25" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html --no-deps
 !source activate mobilenerf && pip install "flax==0.5.3" scipy "optax==0.1.4" "chex==0.1.5" "absl-py" --no-deps
 !source activate mobilenerf && pip install tqdm opencv-python-headless matplotlib gin-config msgpack typing-extensions opt_einsum toolz rich PyYAML numpy==1.23.5
+!source activate mobilenerf && pip install torch torchvision torchaudio pytorch3d
 
 print("✅ 运行环境搭建完毕！")
 
@@ -633,3 +635,82 @@ if os.path.exists(LOCAL_S3_OBJ_SAVE):
         os.system(f"cp -r '{phone_src}/.' '{phone_dst}/'")
 
 print(f"\n✅ 全部完成！高精度 Sponza 已保存至: {DRIVE_FINAL_EXPORT}")
+
+"""# Cell 8: Hybrid Pipeline Step 1 - 预计算 UV (PyTorch3D)"""
+
+import os
+from IPython import get_ipython
+from google.colab import drive
+
+PROJECT_ROOT_HYBRID = "/content/jax3d/jax3d/projects/mobilenerf"
+DRIVE_HYBRID_ROOT = "/content/drive/MyDrive/Hybrid_Pipeline"
+
+print("\n🚀 [Hybrid 1/2] 预计算 UV 映射 (PyTorch3D)...")
+
+if not os.path.exists("/content/drive"):
+    drive.mount("/content/drive")
+
+if os.path.exists(PROJECT_ROOT_HYBRID):
+    os.chdir(PROJECT_ROOT_HYBRID)
+    cmd = """
+source activate mobilenerf && export MPLBACKEND=Agg && python 01_preprocess_raster.py \
+  --data_root='data/custom/MyNeRFData' \
+  --obj_name='sponza_gt.obj' \
+  --transforms='transforms_train.json' \
+  --output='uv_lookup.npz'
+"""
+    get_ipython().system(cmd)
+
+    uv_path = os.path.join(PROJECT_ROOT_HYBRID, "data/custom/MyNeRFData/uv_lookup.npz")
+    if os.path.exists(uv_path):
+        if not os.path.exists(DRIVE_HYBRID_ROOT):
+            os.makedirs(DRIVE_HYBRID_ROOT)
+        os.system(f"cp '{uv_path}' '{DRIVE_HYBRID_ROOT}/'")
+        print(f"✅ UV 映射已备份到: {DRIVE_HYBRID_ROOT}")
+    else:
+        print("⚠️ 未找到 uv_lookup.npz，请检查本地运行结果")
+else:
+    print(f"❌ 找不到项目目录: {PROJECT_ROOT_HYBRID}")
+
+"""# Cell 9: Hybrid Pipeline Step 2 - 训练 Hybrid Texture + MLP"""
+
+print("\n🚀 [Hybrid 2/2] 启动 Hybrid Texture + MLP 训练...")
+
+if not os.path.exists("/content/drive"):
+    drive.mount("/content/drive")
+
+if os.path.exists(PROJECT_ROOT_HYBRID):
+    os.chdir(PROJECT_ROOT_HYBRID)
+    cmd = """
+source activate mobilenerf && export MPLBACKEND=Agg && python 02_train_hybrid.py \
+  --data_root='data/custom/MyNeRFData' \
+  --uv_path='data/custom/MyNeRFData/uv_lookup.npz' \
+  --texture_size=2048 \
+  --batch_size=4096 \
+  --num_iters=200000 \
+  --checkpoint='weights/hybrid_texture_mlp.pth'
+"""
+    get_ipython().system(cmd)
+
+    print("\n📦 正在备份 Hybrid 训练结果到 Drive...")
+    if not os.path.exists(DRIVE_HYBRID_ROOT):
+        os.makedirs(DRIVE_HYBRID_ROOT)
+
+    local_weights = os.path.join(PROJECT_ROOT_HYBRID, "weights")
+    local_samples = os.path.join(PROJECT_ROOT_HYBRID, "samples")
+
+    if os.path.exists(local_weights):
+        dst_weights = os.path.join(DRIVE_HYBRID_ROOT, "weights")
+        if not os.path.exists(dst_weights):
+            os.makedirs(dst_weights)
+        os.system(f"cp -ru '{local_weights}/.' '{dst_weights}/'")
+
+    if os.path.exists(local_samples):
+        dst_samples = os.path.join(DRIVE_HYBRID_ROOT, "samples")
+        if not os.path.exists(dst_samples):
+            os.makedirs(dst_samples)
+        os.system(f"cp -ru '{local_samples}/.' '{dst_samples}/'")
+
+    print(f"\n✅ Hybrid 训练结果已保存至: {DRIVE_HYBRID_ROOT}")
+else:
+    print(f"❌ 找不到项目目录: {PROJECT_ROOT_HYBRID}")
