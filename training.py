@@ -26,7 +26,8 @@ print("✅ Conda 安装完成！正在配置 Python 3.9 环境...")
 !source activate mobilenerf && pip install "flax==0.5.3" scipy "optax==0.1.4" "chex==0.1.5" "absl-py" --no-deps
 # 安装其他工具
 !source activate mobilenerf && pip install tqdm opencv-python-headless matplotlib gin-config msgpack typing-extensions opt_einsum toolz rich PyYAML numpy==1.23.5
-!source activate mobilenerf && pip install torch torchvision torchaudio pytorch3d
+!source activate mobilenerf && conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=11.8 -y
+!source activate mobilenerf && conda install -c pytorch3d pytorch3d -y
 
 # 下载代码
 if not os.path.exists('/content/jax3d'):
@@ -62,7 +63,8 @@ print("✅ Conda 就绪！配置 Python 3.9 + JAX...")
 !source activate mobilenerf && pip install "jax[cuda11_pip]==0.3.25" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html --no-deps
 !source activate mobilenerf && pip install "flax==0.5.3" scipy "optax==0.1.4" "chex==0.1.5" "absl-py" --no-deps
 !source activate mobilenerf && pip install tqdm opencv-python-headless matplotlib gin-config msgpack typing-extensions opt_einsum toolz rich PyYAML numpy==1.23.5
-!source activate mobilenerf && pip install torch torchvision torchaudio pytorch3d
+!source activate mobilenerf && conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=11.8 -y
+!source activate mobilenerf && conda install -c pytorch3d pytorch3d -y
 
 print("✅ 运行环境搭建完毕！")
 
@@ -636,33 +638,68 @@ if os.path.exists(LOCAL_S3_OBJ_SAVE):
 
 print(f"\n✅ 全部完成！高精度 Sponza 已保存至: {DRIVE_FINAL_EXPORT}")
 
-"""# Cell 8: Hybrid Pipeline Step 1 - 预计算 UV (PyTorch3D)"""
+"""# Cell 8: Hybrid Workflow 环境配置（基于 Colab 默认环境）"""
+
+643→print("\n🚀 [Hybrid Env] 配置 Torch + PyTorch3D 环境（使用 Colab 默认 Python）...")
+644→
+645→!pip install --upgrade pip
+646→!pip install "numpy<2"
+647→!pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 -f https://download.pytorch.org/whl/torch_stable.html
+
+"""# Cell 8-UV: 01_preprocess_raster 专用环境（独立 Conda + PyTorch3D）"""
+
+print("\n🚀 [Hybrid UV Env] 使用 Conda 配置 01_preprocess_raster 专用环境...")
+
+!conda create -n hybrid3d_uv python=3.11 -y
+!source activate hybrid3d_uv && conda install -y pytorch=2.3.1 torchvision=0.18.1 torchaudio=2.3.1 pytorch-cuda=11.8 -c pytorch -c nvidia -c conda-forge
+!source activate hybrid3d_uv && conda install -y pytorch3d=0.7.8 -c pytorch3d -c pytorch -c nvidia -c conda-forge
+
+"""# Cell 9: Hybrid Pipeline Step 1 - 预计算 UV (PyTorch3D)"""
 
 import os
 from IPython import get_ipython
 from google.colab import drive
+import numpy as np
 
 PROJECT_ROOT_HYBRID = "/content/jax3d/jax3d/projects/mobilenerf"
 DRIVE_HYBRID_ROOT = "/content/drive/MyDrive/Hybrid_Pipeline"
 
+HYBRID_DATA_ROOT = "data/custom/MyNeRFData"
+HYBRID_OBJ_NAME = "sponza_gt.obj"
+HYBRID_TRANSFORMS = "transforms_train.json"
+HYBRID_UV_OUTPUT = "uv_lookup.npz"
+HYBRID_ENV_PYTHON = "/usr/local/envs/hybrid3d_uv/bin/python"
+
+HYBRID_IMAGE_DOWNSCALE = 1
+
 print("\n🚀 [Hybrid 1/2] 预计算 UV 映射 (PyTorch3D)...")
+print(f"   -> 图像 / UV 分辨率缩放倍数: {HYBRID_IMAGE_DOWNSCALE}（1 表示与训练 PNG 一致）")
 
 if not os.path.exists("/content/drive"):
     drive.mount("/content/drive")
 
+if not os.path.exists(DRIVE_HYBRID_ROOT):
+    os.makedirs(DRIVE_HYBRID_ROOT)
+    print(f"📁 已创建 Hybrid 结果目录: {DRIVE_HYBRID_ROOT}")
+
 if os.path.exists(PROJECT_ROOT_HYBRID):
     os.chdir(PROJECT_ROOT_HYBRID)
-    cmd = """
-source activate mobilenerf && export MPLBACKEND=Agg && python 01_preprocess_raster.py \
-  --data_root='data/custom/MyNeRFData' \
-  --obj_name='sponza_gt.obj' \
-  --transforms='transforms_train.json' \
-  --output='uv_lookup.npz'
+    cmd = f"""
+export MPLBACKEND=Agg && {HYBRID_ENV_PYTHON} 01_preprocess_raster.py \
+  --data_root='{HYBRID_DATA_ROOT}' \
+  --obj_name='{HYBRID_OBJ_NAME}' \
+  --transforms='{HYBRID_TRANSFORMS}' \
+  --output='{HYBRID_UV_OUTPUT}' \
+  --downscale={HYBRID_IMAGE_DOWNSCALE}
 """
     get_ipython().system(cmd)
 
-    uv_path = os.path.join(PROJECT_ROOT_HYBRID, "data/custom/MyNeRFData/uv_lookup.npz")
+    uv_path = os.path.join(PROJECT_ROOT_HYBRID, HYBRID_DATA_ROOT, HYBRID_UV_OUTPUT)
     if os.path.exists(uv_path):
+        data = np.load(uv_path, allow_pickle=True)
+        uv_shape = data["uv"].shape
+        print(f"✅ UV 映射生成完成，形状: {uv_shape}")
+
         if not os.path.exists(DRIVE_HYBRID_ROOT):
             os.makedirs(DRIVE_HYBRID_ROOT)
         os.system(f"cp '{uv_path}' '{DRIVE_HYBRID_ROOT}/'")
@@ -672,23 +709,82 @@ source activate mobilenerf && export MPLBACKEND=Agg && python 01_preprocess_rast
 else:
     print(f"❌ 找不到项目目录: {PROJECT_ROOT_HYBRID}")
 
-"""# Cell 9: Hybrid Pipeline Step 2 - 训练 Hybrid Texture + MLP"""
+"""# Cell 11: Hybrid Pipeline Step 2 - 训练 Hybrid Texture + MLP"""
+
+import os
+import time
+import threading
+from IPython import get_ipython
+from google.colab import drive
+
+PROJECT_ROOT_HYBRID = "/content/jax3d/jax3d/projects/mobilenerf"
+DRIVE_HYBRID_ROOT = "/content/drive/MyDrive/Hybrid_Pipeline"
+
+HYBRID_DATA_ROOT_TRAIN = "data/custom/MyNeRFData_1k"
+HYBRID_UV_PATH_TRAIN = os.path.join(HYBRID_DATA_ROOT_TRAIN, "uv_lookup.npz")
+
+HYBRID_TEXTURE_SIZE = 512
+HYBRID_BATCH_SIZE = 1024
+HYBRID_NUM_ITERS = 150000
+HYBRID_LR = 3e-4
+HYBRID_DOWNSCALE_TRAIN = 1
+
+HYBRID_CHECKPOINT_PATH = "weights/hybrid_texture_mlp.pth"
+HYBRID_ENV_PYTHON = "python"
 
 print("\n🚀 [Hybrid 2/2] 启动 Hybrid Texture + MLP 训练...")
 
 if not os.path.exists("/content/drive"):
     drive.mount("/content/drive")
 
+if not os.path.exists(DRIVE_HYBRID_ROOT):
+    os.makedirs(DRIVE_HYBRID_ROOT)
+
+local_weights = os.path.join(PROJECT_ROOT_HYBRID, "weights")
+local_samples = os.path.join(PROJECT_ROOT_HYBRID, "samples")
+dst_weights = os.path.join(DRIVE_HYBRID_ROOT, "weights")
+dst_samples = os.path.join(DRIVE_HYBRID_ROOT, "samples")
+
+def hybrid_background_backup():
+    while True:
+        try:
+            if os.path.exists(local_weights):
+                if not os.path.exists(dst_weights):
+                    os.makedirs(dst_weights)
+                os.system(f"cp -ru '{local_weights}/.' '{dst_weights}/'")
+            if os.path.exists(local_samples):
+                if not os.path.exists(dst_samples):
+                    os.makedirs(dst_samples)
+                os.system(f"cp -ru '{local_samples}/.' '{dst_samples}/'")
+        except:
+            pass
+        time.sleep(60)
+
+t = threading.Thread(target=hybrid_background_backup)
+t.daemon = True
+t.start()
+
+local_uv_path = os.path.join(PROJECT_ROOT_HYBRID, HYBRID_UV_PATH_TRAIN)
+drive_uv_path = os.path.join(DRIVE_HYBRID_ROOT, os.path.basename(HYBRID_UV_PATH_TRAIN))
+
+if not os.path.exists(local_uv_path) and os.path.exists(drive_uv_path):
+    os.makedirs(os.path.dirname(local_uv_path), exist_ok=True)
+    os.system(f"cp '{drive_uv_path}' '{local_uv_path}'")
+    print(f"🔄 已从 Drive 恢复 uv_lookup.npz 到本地: {local_uv_path}")
+
 if os.path.exists(PROJECT_ROOT_HYBRID):
     os.chdir(PROJECT_ROOT_HYBRID)
-    cmd = """
-source activate mobilenerf && export MPLBACKEND=Agg && python 02_train_hybrid.py \
-  --data_root='data/custom/MyNeRFData' \
-  --uv_path='data/custom/MyNeRFData/uv_lookup.npz' \
-  --texture_size=2048 \
-  --batch_size=4096 \
-  --num_iters=200000 \
-  --checkpoint='weights/hybrid_texture_mlp.pth'
+    cmd = f"""
+export MPLBACKEND=Agg && {HYBRID_ENV_PYTHON} 02_train_hybrid.py \
+  --data_root='{HYBRID_DATA_ROOT_TRAIN}' \
+  --uv_path='{HYBRID_UV_PATH_TRAIN}' \
+  --texture_size={HYBRID_TEXTURE_SIZE} \
+  --batch_size={HYBRID_BATCH_SIZE} \
+  --num_iters={HYBRID_NUM_ITERS} \
+  --lr={HYBRID_LR} \
+  --device='auto' \
+  --downscale={HYBRID_DOWNSCALE_TRAIN} \
+  --checkpoint='{HYBRID_CHECKPOINT_PATH}'
 """
     get_ipython().system(cmd)
 

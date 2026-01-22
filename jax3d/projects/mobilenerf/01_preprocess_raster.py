@@ -6,12 +6,9 @@ import numpy as np
 from PIL import Image
 
 import torch
-from pytorch3d.io import load_objs_as_meshes
-from pytorch3d.renderer import (
-    PerspectiveCameras,
-    RasterizationSettings,
-    MeshRasterizer,
-)
+from pytorch3d.io import load_obj
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import PerspectiveCameras, RasterizationSettings, MeshRasterizer
 from tqdm import tqdm
 
 
@@ -93,27 +90,25 @@ def build_cameras(c2w, hwf, device):
     return cameras
 
 
-def compute_uv_lookup(mesh, cameras, hwf, device, faces_per_pixel=1):
+def compute_uv_lookup(mesh, cameras, hwf, device, verts_uvs, faces_uvs, faces_per_pixel=1):
     h, w, _ = hwf.astype(np.int32)
     raster_settings = RasterizationSettings(
         image_size=(int(h), int(w)),
         blur_radius=0.0,
         faces_per_pixel=faces_per_pixel,
+        cull_backfaces=True,
         bin_size=0,
     )
 
     rasterizer = MeshRasterizer(raster_settings=raster_settings)
-
-    textures = mesh.textures
-    verts_uvs = textures.verts_uvs_packed()
-    faces_uvs = textures.faces_uvs_packed()
 
     all_uv = []
     all_mask = []
 
     num_views = cameras.R.shape[0]
     for i in tqdm(range(num_views), desc="Rasterizing views", unit="view"):
-        cam = cameras[i : i + 1]
+        cam_idx = torch.tensor([i], device=device, dtype=torch.long)
+        cam = cameras[cam_idx]
         fragments = rasterizer(meshes_world=mesh, cameras=cam)
         pix_to_face = fragments.pix_to_face[0, ..., 0]
         bary_coords = fragments.bary_coords[0, ..., 0, :]
@@ -172,6 +167,11 @@ def main():
         type=str,
         default="uv_lookup.npz",
     )
+    parser.add_argument(
+        "--downscale",
+        type=int,
+        default=1,
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -181,15 +181,29 @@ def main():
     c2w = data["c2w"]
     image_paths = data["image_paths"]
 
+    ds = max(1, int(args.downscale))
+    if ds > 1:
+        hwf = hwf.copy()
+        hwf[0] = hwf[0] / ds
+        hwf[1] = hwf[1] / ds
+        hwf[2] = hwf[2] / ds
+
     obj_path = os.path.join(args.data_root, args.obj_name)
     if not os.path.exists(obj_path):
         raise RuntimeError("OBJ file not found: {}".format(obj_path))
 
-    mesh = load_objs_as_meshes([obj_path], device=device)
+    verts, faces, aux = load_obj(obj_path, device=device, load_textures=False)
+    verts_uvs = aux.verts_uvs
+    faces_uvs = faces.textures_idx
+
+    if verts_uvs is None or faces_uvs is None or verts_uvs.numel() == 0 or faces_uvs.numel() == 0:
+        raise RuntimeError("OBJ file has no valid UV coordinates.")
+
+    mesh = Meshes(verts=[verts], faces=[faces.verts_idx]).to(device)
 
     cameras = build_cameras(c2w, hwf, device)
 
-    uv, mask = compute_uv_lookup(mesh, cameras, hwf, device)
+    uv, mask = compute_uv_lookup(mesh, cameras, hwf, device, verts_uvs, faces_uvs)
 
     output_path = os.path.join(args.data_root, args.output)
     np.savez_compressed(

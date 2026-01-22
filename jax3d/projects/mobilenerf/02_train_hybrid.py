@@ -105,6 +105,52 @@ class HybridTextureMLP(nn.Module):
         return rgb
 
 
+def export_mobilenerf_assets(model, texture_size, export_dir):
+    os.makedirs(export_dir, exist_ok=True)
+
+    with torch.no_grad():
+        tex = model.texture.detach().cpu()[0]
+    tex = tex.clamp(0.0, 1.0)
+    tex_uint8 = (tex * 255.0).round().to(dtype=torch.uint8)
+    tex_uint8 = tex_uint8.permute(1, 2, 0).numpy()
+
+    h, w, c = tex_uint8.shape
+    if c % 4 != 0:
+        raise RuntimeError("num_channels must be divisible by 4 for feat0/feat1 export")
+
+    out_feat_num = c // 4
+    for i in range(out_feat_num):
+        ff = np.zeros((h, w, 4), dtype=np.uint8)
+        ff[..., 0] = tex_uint8[..., i * 4 + 2]
+        ff[..., 1] = tex_uint8[..., i * 4 + 1]
+        ff[..., 2] = tex_uint8[..., i * 4 + 0]
+        ff[..., 3] = tex_uint8[..., i * 4 + 3]
+        img = Image.fromarray(ff, mode="RGBA")
+        img.save(os.path.join(export_dir, f"shape.pngfeat{i}.png"))
+
+    mlp = model.mlp
+    w0 = mlp[0].weight.detach().cpu().t().numpy().tolist()
+    b0 = mlp[0].bias.detach().cpu().numpy().tolist()
+    w1 = mlp[2].weight.detach().cpu().t().numpy().tolist()
+    b1 = mlp[2].bias.detach().cpu().numpy().tolist()
+    w2 = mlp[4].weight.detach().cpu().t().numpy().tolist()
+    b2 = mlp[4].bias.detach().cpu().numpy().tolist()
+
+    mlp_params = {
+        "0_weights": w0,
+        "1_weights": w1,
+        "2_weights": w2,
+        "0_bias": b0,
+        "1_bias": b1,
+        "2_bias": b2,
+        "obj_num": 1,
+    }
+
+    scene_params_path = os.path.join(export_dir, "mlp.json")
+    with open(scene_params_path, "w", encoding="utf-8") as f:
+        json.dump(mlp_params, f)
+
+
 def sample_batch(
     batch_size,
     uv_all,
@@ -163,12 +209,12 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=4096,
+        default=2048,
     )
     parser.add_argument(
         "--num_iters",
         type=int,
-        default=200000,
+        default=150000,
     )
     parser.add_argument(
         "--lr",
@@ -180,18 +226,59 @@ def main():
         type=str,
         default=os.path.join("weights", "hybrid_texture_mlp.pth"),
     )
+    parser.add_argument(
+        "--export_dir",
+        type=str,
+        default=os.path.join("weights", "mobilenerf_export"),
+    )
+    parser.add_argument(
+        "--downscale",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+    )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA 不可用，但 device=cuda 被指定")
+        device = torch.device("cuda")
+    elif args.device == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    uv_data = np.load(args.uv_path, allow_pickle=True)
-    uv_all = torch.from_numpy(uv_data["uv"]).to(device=device, dtype=torch.float32)
-    mask_all = torch.from_numpy(uv_data["mask"]).to(device=device)
+    print("Hybrid training device:", device)
+    print("torch.cuda.is_available:", torch.cuda.is_available())
+    if device.type == "cuda":
+        print("CUDA version:", torch.version.cuda)
+        print("GPU name:", torch.cuda.get_device_name(0))
+
+    uv_data = np.load(args.uv_path, allow_pickle=True, mmap_mode="r")
+    uv_np = uv_data["uv"]
+    mask_np = uv_data["mask"]
+    ds = max(1, int(args.downscale))
+    if ds > 1:
+        uv_np = uv_np[:, ::ds, ::ds, :]
+        mask_np = mask_np[:, ::ds, ::ds]
+    uv_all = torch.from_numpy(uv_np).to(device=device, dtype=torch.float32)
+    mask_all = torch.from_numpy(mask_np).to(device=device)
 
     train_data = load_blender_train(args.data_root, args.transforms)
     images_np = train_data["images"]
     c2w_np = train_data["c2w"]
     hwf = train_data["hwf"]
+
+    if ds > 1:
+        images_np = images_np[:, ::ds, ::ds, :]
+        hwf[0] = hwf[0] / ds
+        hwf[1] = hwf[1] / ds
+        hwf[2] = hwf[2] / ds
 
     images = torch.from_numpy(images_np).to(device=device, dtype=torch.float32)
     c2w_all = torch.from_numpy(c2w_np).to(device=device, dtype=torch.float32)
@@ -227,13 +314,27 @@ def main():
         loss.backward()
         optimizer.step()
 
+        t = (step + 1) / float(args.num_iters)
+        lr_now = args.lr * (0.01 ** t)
+        for g in optimizer.param_groups:
+            g["lr"] = lr_now
+
         if (step + 1) % 100 == 0:
             with torch.no_grad():
                 mse = loss.item()
                 psnr = -10.0 * np.log10(mse + 1e-8)
-            pbar.set_postfix(loss=mse, psnr=psnr)
+            pbar.set_postfix(loss=mse, psnr=psnr, lr=lr_now)
 
         if (step + 1) % 10000 == 0:
+            with torch.no_grad():
+                mse = loss.item()
+                psnr = -10.0 * np.log10(mse + 1e-8)
+            print(
+                "[Hybrid] step {}/{} | loss={:.6f} | psnr={:.2f} | lr={:.2e}".format(
+                    step + 1, args.num_iters, mse, psnr, lr_now
+                )
+            )
+
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -243,6 +344,8 @@ def main():
                 },
                 args.checkpoint,
             )
+
+            export_mobilenerf_assets(model, args.texture_size, args.export_dir)
 
             view_idx = 0
             model.eval()
