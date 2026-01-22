@@ -134,6 +134,31 @@ else:
 
 print("🎉 准备就绪！请上传数据包 MyNeRFData.zip 并运行下一步。")
 
+"""# Cell 2-Drive: 从 Google Drive 复制 MyNeRFData.zip（可选）"""
+
+import os
+from google.colab import drive
+
+drive_zip_path = "/content/drive/MyDrive/MyNeRFData.zip"
+local_zip_path = "/content/MyNeRFData.zip"
+
+print("📂 [可选] 正在检查 Drive 上是否已有 MyNeRFData.zip ...")
+
+if not os.path.exists("/content/drive"):
+    drive.mount("/content/drive")
+
+if os.path.exists(local_zip_path):
+    print(f"✅ 本地已存在 {local_zip_path}，跳过从 Drive 复制。")
+elif os.path.exists(drive_zip_path):
+    print(f"🔄 在 Drive 找到数据集: {drive_zip_path}")
+    print("   -> 正在复制到本地 /content/MyNeRFData.zip ...")
+    os.system(f"cp '{drive_zip_path}' '{local_zip_path}'")
+    print("✅ 复制完成！可以直接运行解压 Cell。")
+else:
+    print("⚠️ Drive 中未找到 MyNeRFData.zip。") 
+    print("   -> 若需要远程加载，请先把数据集上传到: MyDrive/MyNeRFData.zip")
+    print("   -> 或者按原流程，在左侧文件栏手动上传到 /content/MyNeRFData.zip")
+
 """# Cell 3: 数据准备（解压 Dataset + 结构修复 + 挂载 Drive）"""
 
 # ==========================================
@@ -638,23 +663,41 @@ if os.path.exists(LOCAL_S3_OBJ_SAVE):
 
 print(f"\n✅ 全部完成！高精度 Sponza 已保存至: {DRIVE_FINAL_EXPORT}")
 
+"""# Cell 8-UV: 01_preprocess_raster 专用环境（Conda Py3.10 + NumPy修复版）"""
+
+import os
+
+# 1. 创建/更新环境
+# 如果环境已存在，conda 会尝试更新；如果不存在会创建。
+print("🚀 [Hybrid UV Env] 正在配置 Python 3.10 环境...")
+!conda create -n hybrid_uv_fixed python=3.10 -y
+
+# 2. 安装核心包 (显式锁定 numpy 版本！)
+# 关键修复：增加 numpy=1.26.4，防止 Conda 自动装 NumPy 2.x
+print("⏳ 正在安装 PyTorch 2.1.0 + NumPy 1.26.4...")
+!source activate hybrid_uv_fixed && conda install -y \
+    pytorch=2.1.0 torchvision=0.16.0 torchaudio=2.1.0 \
+    pytorch-cuda=11.8 \
+    numpy=1.26.4 \
+    -c pytorch -c nvidia
+
+# 3. 安装 PyTorch3D
+print("⏳ 正在安装 PyTorch3D...")
+!source activate hybrid_uv_fixed && conda install -y pytorch3d -c pytorch3d
+
+print("\n✅ 环境修复完成！NumPy 已降级，GPU 已就绪。")
+
 """# Cell 8: Hybrid Workflow 环境配置（基于 Colab 默认环境）"""
 
-643→print("\n🚀 [Hybrid Env] 配置 Torch + PyTorch3D 环境（使用 Colab 默认 Python）...")
-644→
-645→!pip install --upgrade pip
-646→!pip install "numpy<2"
-647→!pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 -f https://download.pytorch.org/whl/torch_stable.html
+print("\n🚀 [Hybrid Env] 配置 Torch + PyTorch3D 环境（使用 Colab 默认 Python）...")
+!pip install --upgrade pip
+!pip install "numpy<2"
+!pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 -f https://download.pytorch.org/whl/torch_stable.html
 
-"""# Cell 8-UV: 01_preprocess_raster 专用环境（独立 Conda + PyTorch3D）"""
-
-print("\n🚀 [Hybrid UV Env] 使用 Conda 配置 01_preprocess_raster 专用环境...")
-
-!conda create -n hybrid3d_uv python=3.11 -y
-!source activate hybrid3d_uv && conda install -y pytorch=2.3.1 torchvision=0.18.1 torchaudio=2.3.1 pytorch-cuda=11.8 -c pytorch -c nvidia -c conda-forge
-!source activate hybrid3d_uv && conda install -y pytorch3d=0.7.8 -c pytorch3d -c pytorch -c nvidia -c conda-forge
-
-"""# Cell 9: Hybrid Pipeline Step 1 - 预计算 UV (PyTorch3D)"""
+# !pip install --upgrade pip
+# !pip install "numpy<2" --force-reinstall
+# !pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 -f https://download.pytorch.org/whl/torch_stable.html
+"""# Cell 9: Hybrid Pipeline Step 1 - 预计算 UV (带路径修复)"""
 
 import os
 from IPython import get_ipython
@@ -663,49 +706,48 @@ import numpy as np
 
 PROJECT_ROOT_HYBRID = "/content/jax3d/jax3d/projects/mobilenerf"
 DRIVE_HYBRID_ROOT = "/content/drive/MyDrive/Hybrid_Pipeline"
-
 HYBRID_DATA_ROOT = "data/custom/MyNeRFData"
 HYBRID_OBJ_NAME = "sponza_gt.obj"
 HYBRID_TRANSFORMS = "transforms_train.json"
 HYBRID_UV_OUTPUT = "uv_lookup.npz"
-HYBRID_ENV_PYTHON = "/usr/local/envs/hybrid3d_uv/bin/python"
 
-HYBRID_IMAGE_DOWNSCALE = 1
-
-print("\n🚀 [Hybrid 1/2] 预计算 UV 映射 (PyTorch3D)...")
-print(f"   -> 图像 / UV 分辨率缩放倍数: {HYBRID_IMAGE_DOWNSCALE}（1 表示与训练 PNG 一致）")
+print("\n🚀 [Hybrid 1/2] 预计算 UV 映射 (Conda Py3.10)...")
 
 if not os.path.exists("/content/drive"):
     drive.mount("/content/drive")
 
 if not os.path.exists(DRIVE_HYBRID_ROOT):
     os.makedirs(DRIVE_HYBRID_ROOT)
-    print(f"📁 已创建 Hybrid 结果目录: {DRIVE_HYBRID_ROOT}")
 
 if os.path.exists(PROJECT_ROOT_HYBRID):
     os.chdir(PROJECT_ROOT_HYBRID)
+
+    # 🔑 核心修复：
+    # 1. 激活 hybrid_uv_fixed (Py3.10)
+    # 2. 手动指定 LD_LIBRARY_PATH (解决 .so 找不到的问题)
     cmd = f"""
-export MPLBACKEND=Agg && {HYBRID_ENV_PYTHON} 01_preprocess_raster.py \
-  --data_root='{HYBRID_DATA_ROOT}' \
-  --obj_name='{HYBRID_OBJ_NAME}' \
-  --transforms='{HYBRID_TRANSFORMS}' \
-  --output='{HYBRID_UV_OUTPUT}' \
-  --downscale={HYBRID_IMAGE_DOWNSCALE}
-"""
-    get_ipython().system(cmd)
+    source activate hybrid_uv_fixed && \
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/envs/hybrid_uv_fixed/lib && \
+    python 01_preprocess_raster.py \
+      --data_root='{HYBRID_DATA_ROOT}' \
+      --obj_name='{HYBRID_OBJ_NAME}' \
+      --transforms='{HYBRID_TRANSFORMS}' \
+      --output='{HYBRID_UV_OUTPUT}' \
+      --downscale=1 \
+      --device='cuda'
+    """
+
+    # 使用 bash 运行以支持 source
+    get_ipython().system(f"bash -c '{cmd}'")
 
     uv_path = os.path.join(PROJECT_ROOT_HYBRID, HYBRID_DATA_ROOT, HYBRID_UV_OUTPUT)
     if os.path.exists(uv_path):
         data = np.load(uv_path, allow_pickle=True)
-        uv_shape = data["uv"].shape
-        print(f"✅ UV 映射生成完成，形状: {uv_shape}")
-
-        if not os.path.exists(DRIVE_HYBRID_ROOT):
-            os.makedirs(DRIVE_HYBRID_ROOT)
+        print(f"✅ UV 映射生成完成，形状: {data['uv'].shape}")
         os.system(f"cp '{uv_path}' '{DRIVE_HYBRID_ROOT}/'")
-        print(f"✅ UV 映射已备份到: {DRIVE_HYBRID_ROOT}")
+        print(f"✅ 备份完成！现在可以去跑训练了。")
     else:
-        print("⚠️ 未找到 uv_lookup.npz，请检查本地运行结果")
+        print("⚠️ 未找到 uv_lookup.npz，请检查上方报错")
 else:
     print(f"❌ 找不到项目目录: {PROJECT_ROOT_HYBRID}")
 

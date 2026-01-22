@@ -97,7 +97,7 @@ def compute_uv_lookup(mesh, cameras, hwf, device, verts_uvs, faces_uvs, faces_pe
         blur_radius=0.0,
         faces_per_pixel=faces_per_pixel,
         cull_backfaces=True,
-        bin_size=0,
+        bin_size=None,
     )
 
     rasterizer = MeshRasterizer(raster_settings=raster_settings)
@@ -172,9 +172,25 @@ def main():
         type=int,
         default=1,
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+    )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA 不可用，但 device=cuda 被指定")
+        device = torch.device("cuda")
+    elif args.device == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("UV raster device:", device)
+    print("torch.cuda.is_available:", torch.cuda.is_available())
 
     data = load_blender_cameras(args.data_root, args.transforms)
     hwf = data["images_hwf"]

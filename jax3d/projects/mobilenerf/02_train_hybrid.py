@@ -90,19 +90,18 @@ class HybridTextureMLP(nn.Module):
 
     def forward(self, uv, viewdirs):
         b = uv.shape[0]
-        grid = uv.view(b, 1, 1, 2)
-        tex = self.texture.expand(b, -1, -1, -1)
+        grid = uv.view(1, b, 1, 2)
         feat = F.grid_sample(
-            tex,
+            self.texture,
             grid,
             mode="bilinear",
-            padding_mode="zeros",
+            padding_mode="border",
             align_corners=True,
         )
-        feat = feat.view(b, -1)
+        feat = feat.squeeze(0).squeeze(-1).permute(1, 0).contiguous()
         x = torch.cat([feat, viewdirs], dim=-1)
         rgb = torch.sigmoid(self.mlp(x))
-        return rgb
+        return rgb  
 
 
 def export_mobilenerf_assets(model, texture_size, export_dir):
