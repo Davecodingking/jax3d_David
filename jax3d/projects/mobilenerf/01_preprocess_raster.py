@@ -42,7 +42,7 @@ def load_blender_cameras(data_dir, transforms_filename):
     }
 
 
-def build_cameras(c2w, hwf, device):
+def build_cameras(c2w, hwf, device, legacy_xy_flip):
     h, w, focal = hwf
     h = float(h)
     w = float(w)
@@ -58,9 +58,20 @@ def build_cameras(c2w, hwf, device):
         bottom = bottom.expand(c2w_torch.shape[0], -1, -1)
         c2w_torch = torch.cat([c2w_torch, bottom], dim=-2)
 
-    w2c = torch.inverse(c2w_torch)
-    R = w2c[:, :3, :3]
-    T = w2c[:, :3, 3]
+    R_c2w = c2w_torch[:, :3, :3]
+    t_c2w = c2w_torch[:, :3, 3]
+
+    R_w2c = R_c2w.transpose(1, 2)
+    t_w2c = -torch.bmm(R_w2c, t_c2w.unsqueeze(-1)).squeeze(-1)
+
+    if legacy_xy_flip:
+        R_w2c[:, 0, :] *= -1.0
+        R_w2c[:, 1, :] *= -1.0
+        t_w2c[:, 0] *= -1.0
+        t_w2c[:, 1] *= -1.0
+
+    R = R_w2c.transpose(1, 2)
+    T = t_w2c
 
     fx = focal
     fy = focal
@@ -117,24 +128,34 @@ def compute_uv_lookup(mesh, cameras, hwf, device, verts_uvs, faces_uvs, faces_pe
         bary_flat = bary_coords.view(-1, 3)
 
         valid = pix_to_face_flat >= 0
-        face_idx_valid = pix_to_face_flat[valid]
 
-        face_uv_idx = faces_uvs[face_idx_valid]
-        verts_uv = verts_uvs[face_uv_idx]
+        if not torch.any(valid):
+            uv = torch.zeros(
+                pix_to_face_flat.shape[0],
+                2,
+                dtype=torch.float32,
+                device=device,
+            )
+            mask = valid.view(int(h), int(w))
+            uv = uv.view(int(h), int(w), 2)
+        else:
+            face_idx_valid = pix_to_face_flat[valid]
+            face_uv_idx = faces_uvs[face_idx_valid]
+            verts_uv = verts_uvs[face_uv_idx]
 
-        bary_valid = bary_flat[valid].unsqueeze(-1)
-        uv_valid = (verts_uv * bary_valid).sum(dim=1)
+            bary_valid = bary_flat[valid].unsqueeze(-1)
+            uv_valid = (verts_uv * bary_valid).sum(dim=1)
 
-        uv = torch.zeros(
-            pix_to_face_flat.shape[0],
-            2,
-            dtype=torch.float32,
-            device=device,
-        )
-        uv[valid] = uv_valid
+            uv = torch.zeros(
+                pix_to_face_flat.shape[0],
+                2,
+                dtype=torch.float32,
+                device=device,
+            )
+            uv[valid] = uv_valid
 
-        uv = uv.view(int(h), int(w), 2)
-        mask = valid.view(int(h), int(w))
+            uv = uv.view(int(h), int(w), 2)
+            mask = valid.view(int(h), int(w))
 
         all_uv.append(uv.cpu().numpy())
         all_mask.append(mask.cpu().numpy())
@@ -178,6 +199,10 @@ def main():
         default="auto",
         choices=["auto", "cuda", "cpu"],
     )
+    parser.add_argument(
+        "--legacy_xy_flip",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     if args.device == "cuda":
@@ -217,7 +242,7 @@ def main():
 
     mesh = Meshes(verts=[verts], faces=[faces.verts_idx]).to(device)
 
-    cameras = build_cameras(c2w, hwf, device)
+    cameras = build_cameras(c2w, hwf, device, legacy_xy_flip=args.legacy_xy_flip)
 
     uv, mask = compute_uv_lookup(mesh, cameras, hwf, device, verts_uvs, faces_uvs)
 

@@ -233,7 +233,7 @@ def main():
     parser.add_argument(
         "--downscale",
         type=int,
-        default=2,
+        default=1,
     )
     parser.add_argument(
         "--device",
