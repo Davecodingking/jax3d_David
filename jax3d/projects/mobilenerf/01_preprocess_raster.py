@@ -107,7 +107,7 @@ def compute_uv_lookup(mesh, cameras, hwf, device, verts_uvs, faces_uvs, faces_pe
         image_size=(int(h), int(w)),
         blur_radius=0.0,
         faces_per_pixel=faces_per_pixel,
-        cull_backfaces=True,
+        cull_backfaces=False,
         bin_size=None,
     )
 
