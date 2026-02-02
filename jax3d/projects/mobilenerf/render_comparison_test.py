@@ -141,17 +141,17 @@ if has_original and has_unwrapped:
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # 第一行：原始 mesh
-    axes[0, 0].imshow(gt_image)
-    axes[0, 0].set_title("Ground Truth (Unity Photo)", fontsize=12, fontweight='bold')
+    axes[0, 0].imshow(render_original)
+    axes[0, 0].set_title("Original Mesh Render", fontsize=12, fontweight='bold')
     axes[0, 0].axis('off')
     
-    axes[0, 1].imshow(render_original)
-    axes[0, 1].set_title("Original Mesh Render", fontsize=12, fontweight='bold')
+    axes[0, 1].imshow(render_unwrapped)
+    axes[0, 1].set_title("Unwrapped Mesh Render", fontsize=12, fontweight='bold')
     axes[0, 1].axis('off')
     
-    diff_original = np.abs(gt_image - render_original).mean(axis=2)
-    im1 = axes[0, 2].imshow(diff_original, cmap='hot', vmin=0, vmax=0.5)
-    axes[0, 2].set_title("Difference (GT - Original)", fontsize=12, fontweight='bold')
+    diff_between = np.abs(render_original - render_unwrapped).mean(axis=2)
+    im1 = axes[0, 2].imshow(diff_between, cmap='hot', vmin=0, vmax=0.5)
+    axes[0, 2].set_title("Difference (Original - Unwrapped)", fontsize=12, fontweight='bold')
     axes[0, 2].axis('off')
     plt.colorbar(im1, ax=axes[0, 2], fraction=0.046)
     
@@ -160,8 +160,9 @@ if has_original and has_unwrapped:
     axes[1, 0].set_title("Ground Truth (Unity Photo)", fontsize=12, fontweight='bold')
     axes[1, 0].axis('off')
     
-    axes[1, 1].imshow(render_unwrapped)
-    axes[1, 1].set_title("Unwrapped Mesh Render", fontsize=12, fontweight='bold')
+    diff_original = np.abs(gt_image - render_original).mean(axis=2)
+    axes[1, 1].imshow(diff_original, cmap='hot', vmin=0, vmax=0.5)
+    axes[1, 1].set_title("Difference (GT - Original)", fontsize=12, fontweight='bold')
     axes[1, 1].axis('off')
     
     diff_unwrapped = np.abs(gt_image - render_unwrapped).mean(axis=2)
@@ -202,29 +203,34 @@ elif has_unwrapped:
 print("\n[5/5] 定量分析...")
 
 if has_original and has_unwrapped:
-    # MSE 和 PSNR
+    mse_between = np.mean((render_original - render_unwrapped) ** 2)
+    psnr_between = -10 * np.log10(mse_between) if mse_between > 0 else float('inf')
+
     mse_original = np.mean((gt_image - render_original) ** 2)
     mse_unwrapped = np.mean((gt_image - render_unwrapped) ** 2)
-    
+
     psnr_original = -10 * np.log10(mse_original) if mse_original > 0 else float('inf')
     psnr_unwrapped = -10 * np.log10(mse_unwrapped) if mse_unwrapped > 0 else float('inf')
-    
-    print(f"\n原始 mesh:")
+
+    print(f"\n原始 vs Unwrapped:")
+    print(f"   MSE: {mse_between:.6f}")
+    print(f"   PSNR: {psnr_between:.2f} dB")
+
+    print(f"\n原始 mesh vs Ground Truth:")
     print(f"   MSE: {mse_original:.6f}")
     print(f"   PSNR: {psnr_original:.2f} dB")
-    
-    print(f"\nUnwrapped mesh:")
+
+    print(f"\nUnwrapped mesh vs Ground Truth:")
     print(f"   MSE: {mse_unwrapped:.6f}")
     print(f"   PSNR: {psnr_unwrapped:.2f} dB")
-    
-    # 判断
-    if abs(mse_original - mse_unwrapped) < 0.001:
-        print("\n   ✅ 两个 mesh 渲染结果几乎相同！")
+
+    if mse_between < 1e-4:
+        print("\n   ✅ 原始与 unwrapped 渲染结果几乎一致")
         print("   ✅ UV unwrap 没有破坏几何")
-    elif mse_unwrapped < mse_original * 1.1:
-        print("\n   ✅ Unwrapped mesh 渲染质量相当")
+    elif mse_between < 1e-3:
+        print("\n   ✅ 原始与 unwrapped 渲染结果接近")
     else:
-        print("\n   ⚠️  Unwrapped mesh 渲染有差异")
+        print("\n   ⚠️  原始与 unwrapped 渲染有明显差异")
 
 elif has_unwrapped:
     mse = np.mean((gt_image - render_unwrapped) ** 2)
