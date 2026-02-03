@@ -19,6 +19,15 @@ from pytorch3d.renderer import (
 DATA_ROOT = "data/custom/MyNeRFData"
 ORIGINAL_OBJ = "sponza_gt.obj"
 UNWRAPPED_OBJ = "sponza_gt_unwarpped.obj"
+
+# 检查 Drive 备份
+DRIVE_ROOT = "/content/drive/MyDrive/Hybrid_Pipeline"
+if not os.path.exists(os.path.join(DATA_ROOT, UNWRAPPED_OBJ)):
+    drive_obj = os.path.join(DRIVE_ROOT, UNWRAPPED_OBJ)
+    if os.path.exists(drive_obj):
+        print(f"🔄 从 Drive 恢复 {UNWRAPPED_OBJ}...")
+        os.system(f"cp '{drive_obj}' '{DATA_ROOT}/'")
+
 TRANSFORMS = "transforms_train.json"
 TEST_FRAME = 0  # 测试第一帧
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -263,7 +272,10 @@ print("3. 如果一致，说明 UV unwrap 成功保留了几何")
 print("="*60)
 
 # 显示结果
-from IPython.display import Image as IPImage, display
-if os.path.exists('render_comparison.png'):
-    plt.show()
-    display(IPImage('render_comparison.png'))
+# 在非交互式环境中，不需要 display
+try:
+    from IPython.display import Image as IPImage, display
+    if os.path.exists('render_comparison.png'):
+        display(IPImage('render_comparison.png'))
+except ImportError:
+    pass # 忽略错误，因为图片已经保存了

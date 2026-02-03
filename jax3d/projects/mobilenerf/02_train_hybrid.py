@@ -104,9 +104,18 @@ class HybridTextureMLP(nn.Module):
         return rgb  
 
 
-def export_mobilenerf_assets(model, texture_size, export_dir):
+def export_mobilenerf_assets(model, texture_size, export_dir, mesh_path=None):
+    """
+    Export assets in MobileNeRF Unity Viewer compatible format.
+
+    Expected by Unity viewer (julienkay/MobileNeRF-Unity-Viewer):
+    - shape0.obj (mesh)
+    - shape0.pngfeat0.png, shape0.pngfeat1.png (feature textures)
+    - mlp.json (MLP weights)
+    """
     os.makedirs(export_dir, exist_ok=True)
 
+    # Export feature textures
     with torch.no_grad():
         tex = model.texture.detach().cpu()[0]
     tex = tex.clamp(0.0, 1.0)
@@ -120,13 +129,16 @@ def export_mobilenerf_assets(model, texture_size, export_dir):
     out_feat_num = c // 4
     for i in range(out_feat_num):
         ff = np.zeros((h, w, 4), dtype=np.uint8)
+        # BGR swap for Unity compatibility
         ff[..., 0] = tex_uint8[..., i * 4 + 2]
         ff[..., 1] = tex_uint8[..., i * 4 + 1]
         ff[..., 2] = tex_uint8[..., i * 4 + 0]
         ff[..., 3] = tex_uint8[..., i * 4 + 3]
         img = Image.fromarray(ff, mode="RGBA")
-        img.save(os.path.join(export_dir, f"shape.pngfeat{i}.png"))
+        # Unity viewer expects: shape0.pngfeat0.png, shape0.pngfeat1.png
+        img.save(os.path.join(export_dir, f"shape0.pngfeat{i}.png"))
 
+    # Export MLP weights
     mlp = model.mlp
     w0 = mlp[0].weight.detach().cpu().t().numpy().tolist()
     b0 = mlp[0].bias.detach().cpu().numpy().tolist()
@@ -148,6 +160,15 @@ def export_mobilenerf_assets(model, texture_size, export_dir):
     scene_params_path = os.path.join(export_dir, "mlp.json")
     with open(scene_params_path, "w", encoding="utf-8") as f:
         json.dump(mlp_params, f)
+
+    # Copy mesh file as shape0.obj (Unity viewer naming convention)
+    if mesh_path and os.path.exists(mesh_path):
+        import shutil
+        dst_mesh = os.path.join(export_dir, "shape0.obj")
+        shutil.copy2(mesh_path, dst_mesh)
+        print(f"   Copied mesh to: {dst_mesh}")
+
+    print(f"   Exported Unity-compatible assets to: {export_dir}")
 
 
 def sample_batch(
@@ -231,6 +252,12 @@ def main():
         default=os.path.join("weights", "mobilenerf_export"),
     )
     parser.add_argument(
+        "--mesh_path",
+        type=str,
+        default=os.path.join("data", "custom", "MyNeRFData", "sponza_gt_unwarpped.obj"),
+        help="Path to unwrapped OBJ mesh (will be copied to export_dir as shape0.obj)",
+    )
+    parser.add_argument(
         "--downscale",
         type=int,
         default=1,
@@ -289,9 +316,35 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
+    start_step = 0
+    
+    # -------------------------------------------------------------------------
+    # Resume from checkpoint if available
+    # -------------------------------------------------------------------------
+    if os.path.exists(args.checkpoint):
+        print(f"🔄 Found checkpoint: {args.checkpoint}. Resuming training...")
+        try:
+            checkpoint_data = torch.load(args.checkpoint, map_location=device)
+            model.load_state_dict(checkpoint_data["model_state_dict"])
+            optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+            if "step" in checkpoint_data:
+                start_step = checkpoint_data["step"]
+            print(f"✅ Resumed from step {start_step}")
+        except Exception as e:
+            print(f"⚠️ Failed to load checkpoint: {e}. Starting from scratch.")
+    else:
+        print("🆕 No checkpoint found. Starting fresh training.")
+
     os.makedirs(os.path.dirname(args.checkpoint), exist_ok=True)
 
-    pbar = tqdm(range(args.num_iters), desc="Hybrid training", unit="iter")
+    # -------------------------------------------------------------------------
+    # Training Loop
+    # -------------------------------------------------------------------------
+    if start_step >= args.num_iters:
+        print(f"🎉 Training already completed ({start_step}/{args.num_iters} steps).")
+        return
+
+    pbar = tqdm(range(start_step, args.num_iters), desc="Hybrid training", unit="iter", initial=start_step, total=args.num_iters)
     for step in pbar:
         batch = sample_batch(
             args.batch_size,
@@ -344,7 +397,7 @@ def main():
                 args.checkpoint,
             )
 
-            export_mobilenerf_assets(model, args.texture_size, args.export_dir)
+            export_mobilenerf_assets(model, args.texture_size, args.export_dir, args.mesh_path)
 
             view_idx = 0
             model.eval()
