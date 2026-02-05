@@ -72,14 +72,62 @@ def generate_viewdirs(indices, ys, xs, c2w_all, pix2cam):
 
 
 class HybridTextureMLP(nn.Module):
-    def __init__(self, texture_size, num_channels=8, hidden_features=(16, 16)):
+    """
+    Hybrid texture + MLP model for view-dependent rendering.
+
+    When use_light_probe=True, the model samples from both a 2D texture and
+    a 3D light probe grid, concatenating their features with view direction
+    before the MLP. This allows learning spatially-varying lighting effects.
+
+    Architecture (with probe):
+        Input: uv (2), world_pos (3), viewdir (3)
+        Texture: uv -> 8-dim features
+        Probe: world_pos -> 16-dim features
+        MLP: [8 + 16 + 3] = 27 -> 32 -> 32 -> 3 RGB
+
+    Architecture (without probe):
+        Input: uv (2), viewdir (3)
+        Texture: uv -> 8-dim features
+        MLP: [8 + 3] = 11 -> 16 -> 16 -> 3 RGB
+    """
+
+    def __init__(
+        self,
+        texture_size,
+        num_channels=8,
+        hidden_features=(16, 16),
+        use_light_probe=False,
+        probe_resolution=16,
+        probe_channels=16,
+        probe_bounds_min=None,
+        probe_bounds_max=None,
+    ):
         super().__init__()
+        self.use_light_probe = use_light_probe
+        self.num_channels = num_channels
+
         self.texture = nn.Parameter(
             torch.zeros(1, num_channels, texture_size, texture_size)
         )
 
+        # Light probe grid (optional)
+        self.light_probe = None
+        if use_light_probe:
+            from model.light_probe import LightProbeGrid
+            self.light_probe = LightProbeGrid(
+                resolution=probe_resolution,
+                num_channels=probe_channels,
+                bounds_min=probe_bounds_min,
+                bounds_max=probe_bounds_max,
+            )
+            # Expanded input: texture(8) + probe(16) + viewdir(3) = 27
+            in_dim = num_channels + probe_channels + 3
+            # Larger hidden layers for expanded input
+            hidden_features = (32, 32)
+        else:
+            in_dim = num_channels + 3
+
         layers = []
-        in_dim = num_channels + 3
         last_dim = in_dim
         for feat in hidden_features:
             layers.append(nn.Linear(last_dim, feat))
@@ -88,7 +136,18 @@ class HybridTextureMLP(nn.Module):
         layers.append(nn.Linear(last_dim, 3))
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, uv, viewdirs):
+    def forward(self, uv, viewdirs, world_pos=None):
+        """
+        Forward pass.
+
+        Args:
+            uv: (N, 2) UV coordinates in [-1, 1] range
+            viewdirs: (N, 3) normalized view directions
+            world_pos: (N, 3) world-space positions (required if use_light_probe=True)
+
+        Returns:
+            (N, 3) RGB colors in [0, 1]
+        """
         b = uv.shape[0]
         grid = uv.view(1, b, 1, 2)
         feat = F.grid_sample(
@@ -99,7 +158,15 @@ class HybridTextureMLP(nn.Module):
             align_corners=True,
         )
         feat = feat.squeeze(0).squeeze(-1).permute(1, 0).contiguous()
-        x = torch.cat([feat, viewdirs], dim=-1)
+
+        if self.use_light_probe and self.light_probe is not None:
+            if world_pos is None:
+                raise ValueError("world_pos required when use_light_probe=True")
+            probe_feat = self.light_probe(world_pos)  # (N, probe_channels)
+            x = torch.cat([feat, probe_feat, viewdirs], dim=-1)
+        else:
+            x = torch.cat([feat, viewdirs], dim=-1)
+
         rgb = torch.sigmoid(self.mlp(x))
         return rgb  
 
@@ -112,6 +179,7 @@ def export_mobilenerf_assets(model, texture_size, export_dir, mesh_path=None):
     - shape0.obj (mesh)
     - shape0.pngfeat0.png, shape0.pngfeat1.png (feature textures)
     - mlp.json (MLP weights)
+    - probe.json (light probe data, if enabled)
     """
     os.makedirs(export_dir, exist_ok=True)
 
@@ -155,11 +223,20 @@ def export_mobilenerf_assets(model, texture_size, export_dir, mesh_path=None):
         "1_bias": b1,
         "2_bias": b2,
         "obj_num": 1,
+        "use_light_probe": model.use_light_probe,
     }
 
     scene_params_path = os.path.join(export_dir, "mlp.json")
     with open(scene_params_path, "w", encoding="utf-8") as f:
         json.dump(mlp_params, f)
+
+    # Export light probe data if enabled
+    if model.use_light_probe and model.light_probe is not None:
+        probe_data = model.light_probe.export_to_dict()
+        probe_path = os.path.join(export_dir, "probe.json")
+        with open(probe_path, "w", encoding="utf-8") as f:
+            json.dump(probe_data, f)
+        print(f"   Exported light probe to: {probe_path}")
 
     # Copy mesh file as shape0.obj (Unity viewer naming convention)
     if mesh_path and os.path.exists(mesh_path):
@@ -179,7 +256,25 @@ def sample_batch(
     c2w_all,
     pix2cam,
     device,
+    pos_all=None,
 ):
+    """
+    Sample a random batch of pixels for training.
+
+    Args:
+        batch_size: Number of pixels to sample
+        uv_all: (N_views, H, W, 2) UV coordinates
+        mask_all: (N_views, H, W) valid pixel mask
+        images: (N_views, H, W, 3) ground truth RGB
+        c2w_all: (N_views, 4, 4) camera-to-world matrices
+        pix2cam: (3, 3) pixel-to-camera matrix
+        device: torch device
+        pos_all: (N_views, H, W, 3) world positions (optional)
+
+    Returns:
+        Tuple of (uv_grid, viewdirs, gt_rgb) or (uv_grid, viewdirs, gt_rgb, world_pos)
+        Returns None if no valid pixels sampled
+    """
     num_views, height, width, _ = uv_all.shape
 
     view_inds = torch.randint(0, num_views, (batch_size,), device=device)
@@ -200,6 +295,10 @@ def sample_batch(
     gt_rgb = images[view_inds, y_inds, x_inds]
 
     viewdirs = generate_viewdirs(view_inds, y_inds, x_inds, c2w_all, pix2cam)
+
+    if pos_all is not None:
+        world_pos = pos_all[view_inds, y_inds, x_inds]
+        return uv_grid, viewdirs, gt_rgb, world_pos
 
     return uv_grid, viewdirs, gt_rgb
 
@@ -268,6 +367,23 @@ def main():
         default="auto",
         choices=["auto", "cuda", "cpu"],
     )
+    parser.add_argument(
+        "--use_light_probe",
+        action="store_true",
+        help="Enable light probe grid for spatially-varying lighting features",
+    )
+    parser.add_argument(
+        "--probe_resolution",
+        type=int,
+        default=16,
+        help="Light probe grid resolution (default 16 -> 16^3 voxels)",
+    )
+    parser.add_argument(
+        "--probe_channels",
+        type=int,
+        default=16,
+        help="Number of feature channels in light probe (default 16)",
+    )
     args = parser.parse_args()
 
     if args.device == "cuda":
@@ -288,12 +404,33 @@ def main():
     uv_data = np.load(args.uv_path, allow_pickle=True, mmap_mode="r")
     uv_np = uv_data["uv"]
     mask_np = uv_data["mask"]
+
+    # Load position data for light probe (if available and enabled)
+    pos_all = None
+    probe_bounds_min = None
+    probe_bounds_max = None
+    if args.use_light_probe:
+        if "pos" not in uv_data:
+            raise RuntimeError(
+                "Light probe enabled but 'pos' not found in uv_lookup.npz. "
+                "Re-run 01_preprocess_raster.py to generate position maps."
+            )
+        pos_np = uv_data["pos"]
+        probe_bounds_min = torch.from_numpy(uv_data["probe_bounds_min"])
+        probe_bounds_max = torch.from_numpy(uv_data["probe_bounds_max"])
+        print(f"Light probe enabled: bounds_min={probe_bounds_min.tolist()}, bounds_max={probe_bounds_max.tolist()}")
+
     ds = max(1, int(args.downscale))
     if ds > 1:
         uv_np = uv_np[:, ::ds, ::ds, :]
         mask_np = mask_np[:, ::ds, ::ds]
+        if args.use_light_probe:
+            pos_np = pos_np[:, ::ds, ::ds, :]
+
     uv_all = torch.from_numpy(uv_np).to(device=device, dtype=torch.float32)
     mask_all = torch.from_numpy(mask_np).to(device=device)
+    if args.use_light_probe:
+        pos_all = torch.from_numpy(pos_np).to(device=device, dtype=torch.float32)
 
     train_data = load_blender_train(args.data_root, args.transforms)
     images_np = train_data["images"]
@@ -312,7 +449,21 @@ def main():
     h, w, focal = hwf
     pix2cam = pix2cam_matrix(h, w, focal, device)
 
-    model = HybridTextureMLP(texture_size=args.texture_size).to(device)
+    model = HybridTextureMLP(
+        texture_size=args.texture_size,
+        use_light_probe=args.use_light_probe,
+        probe_resolution=args.probe_resolution,
+        probe_channels=args.probe_channels,
+        probe_bounds_min=probe_bounds_min,
+        probe_bounds_max=probe_bounds_max,
+    ).to(device)
+
+    if args.use_light_probe:
+        total_params = sum(p.numel() for p in model.parameters())
+        mlp_params = sum(p.numel() for p in model.mlp.parameters())
+        probe_params = sum(p.numel() for p in model.light_probe.parameters())
+        print(f"Model parameters: total={total_params}, MLP={mlp_params}, probe={probe_params}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
 
@@ -354,14 +505,19 @@ def main():
             c2w_all,
             pix2cam,
             device,
+            pos_all=pos_all,
         )
         if batch is None:
             continue
 
-        uv_grid, viewdirs, gt_rgb = batch
+        if pos_all is not None:
+            uv_grid, viewdirs, gt_rgb, world_pos = batch
+        else:
+            uv_grid, viewdirs, gt_rgb = batch
+            world_pos = None
 
         optimizer.zero_grad()
-        pred_rgb = model(uv_grid, viewdirs)
+        pred_rgb = model(uv_grid, viewdirs, world_pos=world_pos)
         loss = criterion(pred_rgb, gt_rgb)
         loss.backward()
         optimizer.step()
@@ -407,6 +563,12 @@ def main():
                 uv_grid_full = uv_view * 2.0 - 1.0
                 uv_flat = uv_grid_full.view(-1, 2)
 
+                # Get world positions for this view if using light probe
+                pos_flat = None
+                if pos_all is not None:
+                    pos_view = pos_all[view_idx]
+                    pos_flat = pos_view.view(-1, 3)
+
                 ys, xs = torch.meshgrid(
                     torch.arange(h_img, device=device),
                     torch.arange(w_img, device=device),
@@ -422,7 +584,8 @@ def main():
                 for i in range(0, uv_flat.shape[0], chunk):
                     u = uv_flat[i:i + chunk]
                     v = viewdirs_full[i:i + chunk]
-                    preds.append(model(u, v))
+                    p = pos_flat[i:i + chunk] if pos_flat is not None else None
+                    preds.append(model(u, v, world_pos=p))
                 preds = torch.cat(preds, dim=0)
                 preds = preds.view(h_img, w_img, 3).clamp(0.0, 1.0).cpu().numpy()
 
