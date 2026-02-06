@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import math
 
 import numpy as np
 from PIL import Image
@@ -9,6 +10,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
+
+
+def positional_encoding(x: torch.Tensor, num_freqs: int) -> torch.Tensor:
+    """
+    Sinusoidal positional encoding.
+
+    Encodes input values using sinusoidal functions at multiple frequencies,
+    following the NeRF positional encoding scheme.
+
+    Args:
+        x: (N,) or (N, D) input values to encode
+        num_freqs: Number of frequency bands
+
+    Returns:
+        Encoded tensor with shape (N, D * (1 + 2 * num_freqs)) or (N, 1 + 2 * num_freqs)
+        Format: [x, sin(pi*x), cos(pi*x), sin(2*pi*x), cos(2*pi*x), ...]
+    """
+    if x.dim() == 1:
+        x = x.unsqueeze(-1)  # (N,) -> (N, 1)
+
+    # Frequency bands: 2^0, 2^1, ..., 2^(num_freqs-1)
+    freqs = 2.0 ** torch.arange(num_freqs, device=x.device, dtype=x.dtype)
+
+    # x_freq shape: (N, D, num_freqs)
+    x_freq = x.unsqueeze(-1) * freqs * math.pi
+
+    # Compute sin and cos
+    sin_enc = torch.sin(x_freq)  # (N, D, num_freqs)
+    cos_enc = torch.cos(x_freq)  # (N, D, num_freqs)
+
+    # Flatten and concatenate: [x, sin, cos]
+    # Result shape: (N, D * (1 + 2 * num_freqs))
+    encoded = torch.cat(
+        [x, sin_enc.flatten(1), cos_enc.flatten(1)], dim=-1
+    )
+
+    return encoded
 
 
 def load_blender_train(data_dir, transforms_filename):
@@ -79,11 +117,22 @@ class HybridTextureMLP(nn.Module):
     a 3D light probe grid, concatenating their features with view direction
     before the MLP. This allows learning spatially-varying lighting effects.
 
-    Architecture (with probe):
+    When use_probe_delta=True, the model additionally uses a Conv3D network
+    to generate per-frame deltas to the probe grid, enabling dynamic/temporal
+    lighting effects (e.g., moving shadows for animated objects).
+
+    Architecture (with probe, no delta):
         Input: uv (2), world_pos (3), viewdir (3)
         Texture: uv -> 8-dim features
         Probe: world_pos -> 16-dim features
         MLP: [8 + 16 + 3] = 27 -> 32 -> 32 -> 3 RGB
+
+    Architecture (with probe + delta):
+        Input: uv (2), world_pos (3), viewdir (3), frame_idx
+        Texture: uv -> 8-dim features
+        Probe Delta: Conv3D(probe + view_enc + frame_enc) -> delta grid
+        Modified Probe: (base_probe + delta) -> 16-dim features
+        MLP: [8 + 16 + 3 + 16] = 43 -> 64 -> 64 -> 3 RGB
 
     Architecture (without probe):
         Input: uv (2), viewdir (3)
@@ -101,10 +150,16 @@ class HybridTextureMLP(nn.Module):
         probe_channels=16,
         probe_bounds_min=None,
         probe_bounds_max=None,
+        use_probe_delta=False,
+        probe_delta_period=200.0,
     ):
         super().__init__()
         self.use_light_probe = use_light_probe
+        self.use_probe_delta = use_probe_delta
+        self.probe_delta_period = probe_delta_period
         self.num_channels = num_channels
+        self.probe_channels = probe_channels
+        self.probe_resolution = probe_resolution
 
         self.texture = nn.Parameter(
             torch.zeros(1, num_channels, texture_size, texture_size)
@@ -120,12 +175,48 @@ class HybridTextureMLP(nn.Module):
                 bounds_min=probe_bounds_min,
                 bounds_max=probe_bounds_max,
             )
-            # Expanded input: texture(8) + probe(16) + viewdir(3) = 27
-            in_dim = num_channels + probe_channels + 3
-            # Larger hidden layers for expanded input
-            hidden_features = (32, 32)
+
+        # Dynamic probe delta network (optional)
+        self.probe_delta_conv3d = None
+        self.probe_delta_scale = None
+        if use_probe_delta and use_light_probe:
+            # Positional encoding dimensions
+            # view_enc: viewdir(3) -> 3 * (1 + 2*2) = 15, truncated to 16
+            # frame_enc: frame(1) -> 1 * (1 + 2*3) = 7, padded to 16
+            self.view_enc_freqs = 2
+            self.frame_enc_freqs = 3
+            self.total_enc_dim = 32  # 16 (view) + 16 (frame)
+
+            # Conv3D delta network for coarse probe modification
+            hidden = max(32, probe_channels * 2)
+            self.probe_delta_conv3d = nn.Sequential(
+                nn.Conv3d(probe_channels + self.total_enc_dim, hidden, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(hidden, hidden, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(hidden, probe_channels, 3, padding=1),
+                nn.Tanh(),
+            )
+            self.probe_delta_scale = nn.Parameter(torch.tensor(0.5))
+
+        # Build MLP with appropriate input dimension
+        if use_light_probe:
+            if use_probe_delta:
+                # texture(8) + probe(16) + viewdir(3) + frame_enc(16) = 43
+                in_dim = num_channels + probe_channels + 3 + 16
+                hidden_features = (64, 64)
+            else:
+                # texture(8) + probe(16) + viewdir(3) = 27
+                in_dim = num_channels + probe_channels + 3
+                hidden_features = (32, 32)
         else:
-            in_dim = num_channels + 3
+            if use_probe_delta:
+                # texture(8) + viewdir(3) + frame_enc(16) = 27
+                in_dim = num_channels + 3 + 16
+                hidden_features = (32, 32)
+            else:
+                # texture(8) + viewdir(3) = 11
+                in_dim = num_channels + 3
 
         layers = []
         last_dim = in_dim
@@ -136,7 +227,7 @@ class HybridTextureMLP(nn.Module):
         layers.append(nn.Linear(last_dim, 3))
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, uv, viewdirs, world_pos=None):
+    def forward(self, uv, viewdirs, world_pos=None, frame_idx=None):
         """
         Forward pass.
 
@@ -144,28 +235,102 @@ class HybridTextureMLP(nn.Module):
             uv: (N, 2) UV coordinates in [-1, 1] range
             viewdirs: (N, 3) normalized view directions
             world_pos: (N, 3) world-space positions (required if use_light_probe=True)
+            frame_idx: (N,) or scalar frame indices (used if use_probe_delta=True)
 
         Returns:
             (N, 3) RGB colors in [0, 1]
         """
-        b = uv.shape[0]
-        grid = uv.view(1, b, 1, 2)
-        feat = F.grid_sample(
+        n = uv.shape[0]
+        device = uv.device
+
+        # Sample texture features
+        grid = uv.view(1, n, 1, 2)
+        tex_feat = F.grid_sample(
             self.texture,
             grid,
             mode="bilinear",
             padding_mode="border",
             align_corners=True,
         )
-        feat = feat.squeeze(0).squeeze(-1).permute(1, 0).contiguous()
+        tex_feat = tex_feat.squeeze(0).squeeze(-1).permute(1, 0).contiguous()  # (N, 8)
 
+        # Compute frame encoding (used for both probe delta AND MLP)
+        frame_enc = None
+        if self.use_probe_delta and frame_idx is not None:
+            # Normalize frame index by period
+            if isinstance(frame_idx, (int, float)):
+                frame_idx = torch.full((n,), frame_idx, device=device, dtype=torch.float32)
+            elif frame_idx.dim() == 0:
+                frame_idx = frame_idx.expand(n).float()
+            else:
+                frame_idx = frame_idx.float()
+
+            frame_norm = frame_idx / self.probe_delta_period  # (N,)
+
+            # Positional encoding for frame
+            frame_enc_raw = positional_encoding(frame_norm, self.frame_enc_freqs)  # (N, 7)
+            # Pad or truncate to 16 dims
+            if frame_enc_raw.shape[1] < 16:
+                padding = torch.zeros(n, 16 - frame_enc_raw.shape[1], device=device)
+                frame_enc = torch.cat([frame_enc_raw, padding], dim=-1)  # (N, 16)
+            else:
+                frame_enc = frame_enc_raw[:, :16]  # (N, 16)
+
+        # Sample probe features
+        probe_feat = None
         if self.use_light_probe and self.light_probe is not None:
             if world_pos is None:
                 raise ValueError("world_pos required when use_light_probe=True")
-            probe_feat = self.light_probe(world_pos)  # (N, probe_channels)
-            x = torch.cat([feat, probe_feat, viewdirs], dim=-1)
+
+            if self.use_probe_delta and frame_idx is not None and self.probe_delta_conv3d is not None:
+                # Encode view direction for probe delta
+                view_enc_raw = positional_encoding(viewdirs, self.view_enc_freqs)  # (N, 15)
+                # Pad or truncate to 16 dims
+                if view_enc_raw.shape[1] < 16:
+                    padding = torch.zeros(n, 16 - view_enc_raw.shape[1], device=device)
+                    view_enc = torch.cat([view_enc_raw, padding], dim=-1)  # (N, 16)
+                else:
+                    view_enc = view_enc_raw[:, :16]  # (N, 16)
+
+                # Concatenate view and frame encodings
+                total_enc = torch.cat([view_enc, frame_enc], dim=-1)  # (N, 32)
+
+                # Broadcast encoding to 3D grid shape
+                r = self.probe_resolution
+                enc_3d = total_enc.view(n, self.total_enc_dim, 1, 1, 1).expand(
+                    n, self.total_enc_dim, r, r, r
+                )  # (N, 32, R, R, R)
+
+                # Expand probe grid to batch
+                probe_grid = self.light_probe.grid.expand(n, -1, -1, -1, -1)  # (N, C, R, R, R)
+
+                # Concatenate probe + encoding
+                conv_input = torch.cat([probe_grid, enc_3d], dim=1)  # (N, C+32, R, R, R)
+
+                # Generate delta
+                delta = self.probe_delta_conv3d(conv_input) * self.probe_delta_scale  # (N, C, R, R, R)
+
+                # Sample with delta
+                probe_feat = self.light_probe.sample_with_delta(world_pos, delta)  # (N, C)
+            else:
+                # Standard probe sampling (no delta)
+                probe_feat = self.light_probe(world_pos)  # (N, probe_channels)
+
+        # Build MLP input
+        if self.use_light_probe and probe_feat is not None:
+            if frame_enc is not None:
+                # texture(8) + probe(16) + viewdir(3) + frame_enc(16) = 43
+                x = torch.cat([tex_feat, probe_feat, viewdirs, frame_enc], dim=-1)
+            else:
+                # texture(8) + probe(16) + viewdir(3) = 27
+                x = torch.cat([tex_feat, probe_feat, viewdirs], dim=-1)
         else:
-            x = torch.cat([feat, viewdirs], dim=-1)
+            if frame_enc is not None:
+                # texture(8) + viewdir(3) + frame_enc(16) = 27
+                x = torch.cat([tex_feat, viewdirs, frame_enc], dim=-1)
+            else:
+                # texture(8) + viewdir(3) = 11
+                x = torch.cat([tex_feat, viewdirs], dim=-1)
 
         rgb = torch.sigmoid(self.mlp(x))
         return rgb  
@@ -257,6 +422,7 @@ def sample_batch(
     pix2cam,
     device,
     pos_all=None,
+    return_frame_idx=False,
 ):
     """
     Sample a random batch of pixels for training.
@@ -270,9 +436,11 @@ def sample_batch(
         pix2cam: (3, 3) pixel-to-camera matrix
         device: torch device
         pos_all: (N_views, H, W, 3) world positions (optional)
+        return_frame_idx: If True, also return frame indices (view_inds)
 
     Returns:
         Tuple of (uv_grid, viewdirs, gt_rgb) or (uv_grid, viewdirs, gt_rgb, world_pos)
+        or (uv_grid, viewdirs, gt_rgb, world_pos, frame_idx) if return_frame_idx=True
         Returns None if no valid pixels sampled
     """
     num_views, height, width, _ = uv_all.shape
@@ -298,7 +466,12 @@ def sample_batch(
 
     if pos_all is not None:
         world_pos = pos_all[view_inds, y_inds, x_inds]
+        if return_frame_idx:
+            return uv_grid, viewdirs, gt_rgb, world_pos, view_inds
         return uv_grid, viewdirs, gt_rgb, world_pos
+
+    if return_frame_idx:
+        return uv_grid, viewdirs, gt_rgb, view_inds
 
     return uv_grid, viewdirs, gt_rgb
 
@@ -384,6 +557,17 @@ def main():
         default=16,
         help="Number of feature channels in light probe (default 16)",
     )
+    parser.add_argument(
+        "--use_probe_delta",
+        action="store_true",
+        help="Enable dynamic probe delta network for temporal/animated lighting",
+    )
+    parser.add_argument(
+        "--probe_delta_period",
+        type=float,
+        default=None,
+        help="Temporal period for probe delta encoding (auto-calculated from frame count if not specified)",
+    )
     args = parser.parse_args()
 
     if args.device == "cuda":
@@ -449,6 +633,15 @@ def main():
     h, w, focal = hwf
     pix2cam = pix2cam_matrix(h, w, focal, device)
 
+    # Auto-calculate probe_delta_period from frame count if not specified
+    num_frames = uv_all.shape[0]
+    probe_delta_period = args.probe_delta_period
+    if args.use_probe_delta and probe_delta_period is None:
+        probe_delta_period = float(num_frames)
+        print(f"Auto-calculated probe_delta_period = {probe_delta_period} (from {num_frames} frames)")
+    elif args.use_probe_delta:
+        print(f"Using specified probe_delta_period = {probe_delta_period}")
+
     model = HybridTextureMLP(
         texture_size=args.texture_size,
         use_light_probe=args.use_light_probe,
@@ -456,13 +649,20 @@ def main():
         probe_channels=args.probe_channels,
         probe_bounds_min=probe_bounds_min,
         probe_bounds_max=probe_bounds_max,
+        use_probe_delta=args.use_probe_delta,
+        probe_delta_period=probe_delta_period if probe_delta_period else 200.0,
     ).to(device)
 
     if args.use_light_probe:
         total_params = sum(p.numel() for p in model.parameters())
         mlp_params = sum(p.numel() for p in model.mlp.parameters())
         probe_params = sum(p.numel() for p in model.light_probe.parameters())
-        print(f"Model parameters: total={total_params}, MLP={mlp_params}, probe={probe_params}")
+        if args.use_probe_delta and model.probe_delta_conv3d is not None:
+            delta_params = sum(p.numel() for p in model.probe_delta_conv3d.parameters())
+            delta_params += 1  # probe_delta_scale
+            print(f"Model parameters: total={total_params}, MLP={mlp_params}, probe={probe_params}, delta_net={delta_params}")
+        else:
+            print(f"Model parameters: total={total_params}, MLP={mlp_params}, probe={probe_params}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
@@ -506,18 +706,27 @@ def main():
             pix2cam,
             device,
             pos_all=pos_all,
+            return_frame_idx=args.use_probe_delta,
         )
         if batch is None:
             continue
 
+        # Unpack batch based on available data
+        frame_idx = None
         if pos_all is not None:
-            uv_grid, viewdirs, gt_rgb, world_pos = batch
+            if args.use_probe_delta:
+                uv_grid, viewdirs, gt_rgb, world_pos, frame_idx = batch
+            else:
+                uv_grid, viewdirs, gt_rgb, world_pos = batch
         else:
-            uv_grid, viewdirs, gt_rgb = batch
+            if args.use_probe_delta:
+                uv_grid, viewdirs, gt_rgb, frame_idx = batch
+            else:
+                uv_grid, viewdirs, gt_rgb = batch
             world_pos = None
 
         optimizer.zero_grad()
-        pred_rgb = model(uv_grid, viewdirs, world_pos=world_pos)
+        pred_rgb = model(uv_grid, viewdirs, world_pos=world_pos, frame_idx=frame_idx)
         loss = criterion(pred_rgb, gt_rgb)
         loss.backward()
         optimizer.step()
@@ -585,7 +794,9 @@ def main():
                     u = uv_flat[i:i + chunk]
                     v = viewdirs_full[i:i + chunk]
                     p = pos_flat[i:i + chunk] if pos_flat is not None else None
-                    preds.append(model(u, v, world_pos=p))
+                    # Pass frame_idx for dynamic probe delta
+                    f_idx = view_idx if args.use_probe_delta else None
+                    preds.append(model(u, v, world_pos=p, frame_idx=f_idx))
                 preds = torch.cat(preds, dim=0)
                 preds = preds.view(h_img, w_img, 3).clamp(0.0, 1.0).cpu().numpy()
 

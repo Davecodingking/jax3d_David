@@ -117,6 +117,56 @@ class LightProbeGrid(nn.Module):
 
         return sampled
 
+    def sample_with_delta(
+        self, world_pos: torch.Tensor, delta_grid: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Sample probe with per-batch delta modification.
+
+        This method applies a delta to the base probe grid before sampling,
+        enabling dynamic/temporal lighting effects where the probe features
+        can vary based on frame index or other conditions.
+
+        Args:
+            world_pos: (N, 3) world-space positions
+            delta_grid: (N, C, R, R, R) delta to add to probe grid per sample
+
+        Returns:
+            (N, C) sampled features from modified probe
+        """
+        n = world_pos.shape[0]
+
+        # Normalize positions to [-1, 1]
+        normalized = self.normalize_positions(world_pos)  # (N, 3)
+
+        # Expand base grid to batch: (1, C, R, R, R) -> (N, C, R, R, R)
+        grid_batch = self.grid.expand(n, -1, -1, -1, -1)
+
+        # Apply delta in 3D space BEFORE sampling
+        modified = grid_batch + delta_grid  # (N, C, R, R, R)
+
+        # grid_sample expects grid in (N, D, H, W, 3) format
+        # For per-sample modified grids, we need to sample each point from its
+        # corresponding modified grid. Reshape for batched sampling:
+        # grid coords: (N, 1, 1, 1, 3) - one sample point per batch item
+        grid_coords = normalized.view(n, 1, 1, 1, 3)
+
+        # Sample from modified grids
+        # Input: (N, C, D, H, W), Grid: (N, 1, 1, 1, 3)
+        # Output: (N, C, 1, 1, 1)
+        sampled = F.grid_sample(
+            modified,
+            grid_coords,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+
+        # Reshape to (N, C)
+        sampled = sampled.view(n, self.num_channels)
+
+        return sampled
+
     def forward(self, world_pos: torch.Tensor) -> torch.Tensor:
         """Forward pass - sample features at world positions."""
         return self.sample(world_pos)
