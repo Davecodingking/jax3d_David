@@ -49,15 +49,40 @@ def positional_encoding(x: torch.Tensor, num_freqs: int) -> torch.Tensor:
     return encoded
 
 
+import re
+
+def extract_animation_frame_numbers(mesh_paths):
+    """
+    Extract animation frame numbers from mesh_path strings.
+
+    Args:
+        mesh_paths: List of mesh path strings (e.g., ["mesh/frame_026.ply", "mesh/frame_067.ply"])
+
+    Returns:
+        List of animation frame numbers (e.g., [26, 67])
+        Returns -1 for paths that don't match the pattern
+    """
+    anim_frames = []
+    for mesh_path in mesh_paths:
+        match = re.search(r'frame_(\d+)', mesh_path)
+        if match:
+            anim_frames.append(int(match.group(1)))
+        else:
+            anim_frames.append(-1)  # Static mesh or unknown format
+    return anim_frames
+
+
 def load_blender_train(data_dir, transforms_filename):
     with open(os.path.join(data_dir, transforms_filename), "r") as fp:
         meta = json.load(fp)
 
     cams = []
     image_paths = []
+    mesh_paths = []
     for frame in meta["frames"]:
         cams.append(np.array(frame["transform_matrix"], dtype=np.float32))
         image_paths.append(os.path.join(data_dir, frame["file_path"] + ".png"))
+        mesh_paths.append(frame.get("mesh_path", ""))
 
     if len(image_paths) == 0:
         raise RuntimeError("No frames found in transforms file")
@@ -82,6 +107,7 @@ def load_blender_train(data_dir, transforms_filename):
         "c2w": poses,
         "hwf": hwf,
         "image_paths": image_paths,
+        "mesh_paths": mesh_paths,
     }
 
 
@@ -423,6 +449,7 @@ def sample_batch(
     device,
     pos_all=None,
     return_frame_idx=False,
+    view_to_anim=None,
 ):
     """
     Sample a random batch of pixels for training.
@@ -436,7 +463,9 @@ def sample_batch(
         pix2cam: (3, 3) pixel-to-camera matrix
         device: torch device
         pos_all: (N_views, H, W, 3) world positions (optional)
-        return_frame_idx: If True, also return frame indices (view_inds)
+        return_frame_idx: If True, also return frame indices
+        view_to_anim: (N_views,) tensor mapping view indices to animation frame numbers
+                      If provided, returns actual animation frames instead of view indices
 
     Returns:
         Tuple of (uv_grid, viewdirs, gt_rgb) or (uv_grid, viewdirs, gt_rgb, world_pos)
@@ -464,14 +493,19 @@ def sample_batch(
 
     viewdirs = generate_viewdirs(view_inds, y_inds, x_inds, c2w_all, pix2cam)
 
+    # Convert view indices to animation frame numbers if mapping provided
+    frame_idx = view_inds
+    if view_to_anim is not None:
+        frame_idx = view_to_anim[view_inds]
+
     if pos_all is not None:
         world_pos = pos_all[view_inds, y_inds, x_inds]
         if return_frame_idx:
-            return uv_grid, viewdirs, gt_rgb, world_pos, view_inds
+            return uv_grid, viewdirs, gt_rgb, world_pos, frame_idx
         return uv_grid, viewdirs, gt_rgb, world_pos
 
     if return_frame_idx:
-        return uv_grid, viewdirs, gt_rgb, view_inds
+        return uv_grid, viewdirs, gt_rgb, frame_idx
 
     return uv_grid, viewdirs, gt_rgb
 
@@ -620,6 +654,26 @@ def main():
     images_np = train_data["images"]
     c2w_np = train_data["c2w"]
     hwf = train_data["hwf"]
+    mesh_paths = train_data["mesh_paths"]
+
+    # -------------------------------------------------------------------------
+    # Build view_idx → animation_frame mapping for probe delta
+    # This ensures we use actual animation frame numbers, not shuffled view indices
+    # -------------------------------------------------------------------------
+    view_to_anim = None
+    max_anim_frame = 0
+    if args.use_probe_delta and mesh_paths:
+        anim_frames = extract_animation_frame_numbers(mesh_paths)
+        valid_frames = [f for f in anim_frames if f >= 0]
+        if valid_frames:
+            max_anim_frame = max(valid_frames)
+            view_to_anim = torch.tensor(anim_frames, dtype=torch.float32, device=device)
+            print(f"📊 Animation frame mapping:")
+            print(f"   - {len(valid_frames)} views with valid animation frames")
+            print(f"   - Animation frame range: 0 to {max_anim_frame}")
+            print(f"   - First 5 mappings: {list(zip(range(5), anim_frames[:5]))}")
+        else:
+            print("⚠️ No valid animation frames found in mesh_paths. Using view indices.")
 
     if ds > 1:
         images_np = images_np[:, ::ds, ::ds, :]
@@ -633,12 +687,19 @@ def main():
     h, w, focal = hwf
     pix2cam = pix2cam_matrix(h, w, focal, device)
 
-    # Auto-calculate probe_delta_period from frame count if not specified
+    # -------------------------------------------------------------------------
+    # Calculate probe_delta_period based on actual animation frame range
+    # Use max_anim_frame + 1 (actual frame range), not num_views (shuffled count)
+    # -------------------------------------------------------------------------
     num_frames = uv_all.shape[0]
     probe_delta_period = args.probe_delta_period
     if args.use_probe_delta and probe_delta_period is None:
-        probe_delta_period = float(num_frames)
-        print(f"Auto-calculated probe_delta_period = {probe_delta_period} (from {num_frames} frames)")
+        if max_anim_frame > 0:
+            probe_delta_period = float(max_anim_frame + 1)
+            print(f"✅ probe_delta_period = {probe_delta_period} (from max animation frame {max_anim_frame})")
+        else:
+            probe_delta_period = float(num_frames)
+            print(f"⚠️ probe_delta_period = {probe_delta_period} (fallback to view count)")
     elif args.use_probe_delta:
         print(f"Using specified probe_delta_period = {probe_delta_period}")
 
@@ -707,6 +768,7 @@ def main():
             device,
             pos_all=pos_all,
             return_frame_idx=args.use_probe_delta,
+            view_to_anim=view_to_anim,
         )
         if batch is None:
             continue
@@ -752,19 +814,22 @@ def main():
                 )
             )
 
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "step": step + 1,
-                    "hwf": hwf,
-                },
-                args.checkpoint,
-            )
+            checkpoint_dict = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "step": step + 1,
+                "hwf": hwf,
+            }
+            # Save animation frame mapping for inference
+            if view_to_anim is not None:
+                checkpoint_dict["view_to_anim"] = view_to_anim.cpu()
+                checkpoint_dict["probe_delta_period"] = probe_delta_period
+                checkpoint_dict["max_anim_frame"] = max_anim_frame
+            torch.save(checkpoint_dict, args.checkpoint)
 
             export_mobilenerf_assets(model, args.texture_size, args.export_dir, args.mesh_path)
 
-            view_idx = 0
+            view_idx = 115
             model.eval()
             with torch.no_grad():
                 uv_view = uv_all[view_idx]
@@ -794,8 +859,13 @@ def main():
                     u = uv_flat[i:i + chunk]
                     v = viewdirs_full[i:i + chunk]
                     p = pos_flat[i:i + chunk] if pos_flat is not None else None
-                    # Pass frame_idx for dynamic probe delta
-                    f_idx = view_idx if args.use_probe_delta else None
+                    # Pass actual animation frame number (not view_idx)
+                    f_idx = None
+                    if args.use_probe_delta:
+                        if view_to_anim is not None:
+                            f_idx = view_to_anim[view_idx].item()
+                        else:
+                            f_idx = view_idx
                     preds.append(model(u, v, world_pos=p, frame_idx=f_idx))
                 preds = torch.cat(preds, dim=0)
                 preds = preds.view(h_img, w_img, 3).clamp(0.0, 1.0).cpu().numpy()
