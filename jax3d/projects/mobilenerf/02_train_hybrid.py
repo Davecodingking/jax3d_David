@@ -602,6 +602,12 @@ def main():
         default=None,
         help="Temporal period for probe delta encoding (auto-calculated from frame count if not specified)",
     )
+    parser.add_argument(
+        "--sample_view_idx",
+        type=int,
+        default=0,
+        help="Which view index (r_X) to use for sample rendering during training",
+    )
     args = parser.parse_args()
 
     if args.device == "cuda":
@@ -829,7 +835,7 @@ def main():
 
             export_mobilenerf_assets(model, args.texture_size, args.export_dir, args.mesh_path)
 
-            view_idx = 115
+            view_idx = args.sample_view_idx
             model.eval()
             with torch.no_grad():
                 uv_view = uv_all[view_idx]
