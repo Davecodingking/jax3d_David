@@ -742,7 +742,7 @@ def main():
     if os.path.exists(args.checkpoint):
         print(f"🔄 Found checkpoint: {args.checkpoint}. Resuming training...")
         try:
-            checkpoint_data = torch.load(args.checkpoint, map_location=device)
+            checkpoint_data = torch.load(args.checkpoint, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint_data["model_state_dict"])
             optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
             if "step" in checkpoint_data:
@@ -799,8 +799,19 @@ def main():
         loss.backward()
         optimizer.step()
 
+        # ========== OPTIMIZED: Better LR decay schedule ==========
+        # Changed from aggressive decay (0.01^t) to gentler decay (0.1^t)
+        # This keeps learning rate higher in later stages for better convergence
         t = (step + 1) / float(args.num_iters)
-        lr_now = args.lr * (0.01 ** t)
+        lr_now = args.lr * (0.1 ** t)  # Changed: 0.01 → 0.1 (10x higher in late stage)
+
+        # Optional: Warmup from checkpoint resume
+        if start_step > 0 and step < start_step + 5000:
+            # Gradually increase LR over first 5k steps after resume
+            warmup_progress = (step - start_step) / 5000.0
+            base_lr_at_resume = args.lr * (0.1 ** (start_step / float(args.num_iters)))
+            lr_now = base_lr_at_resume + (lr_now - base_lr_at_resume) * warmup_progress
+
         for g in optimizer.param_groups:
             g["lr"] = lr_now
 
