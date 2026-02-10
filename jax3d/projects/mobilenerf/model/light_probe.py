@@ -167,6 +167,51 @@ class LightProbeGrid(nn.Module):
 
         return sampled
 
+    def sample_with_shared_delta(
+        self, world_pos: torch.Tensor, shared_delta: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Sample probe with a single shared delta for all points.
+
+        This is an optimized version for inference where we use one
+        precomputed delta for all pixels in a frame, instead of
+        computing per-pixel deltas.
+
+        Args:
+            world_pos: (N, 3) world-space positions
+            shared_delta: (1, C, R, R, R) single delta grid to apply
+
+        Returns:
+            (N, C) sampled features from modified probe
+        """
+        n = world_pos.shape[0]
+
+        # Normalize positions to [-1, 1]
+        normalized = self.normalize_positions(world_pos)  # (N, 3)
+
+        # Apply shared delta to base grid (broadcast)
+        modified = self.grid + shared_delta  # (1, C, R, R, R)
+
+        # Sample all points from the same modified grid
+        # grid_sample expects grid in (N, D, H, W, 3) format
+        # For shared grid, use batch size 1 and sample all points at once
+        grid_coords = normalized.view(1, n, 1, 1, 3)  # (1, N, 1, 1, 3)
+
+        # Sample from modified grid
+        sampled = F.grid_sample(
+            modified,  # (1, C, R, R, R)
+            grid_coords,  # (1, N, 1, 1, 3)
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )  # (1, C, N, 1, 1)
+
+        # Reshape to (N, C)
+        sampled = sampled.squeeze(0).squeeze(-1).squeeze(-1)  # (C, N)
+        sampled = sampled.permute(1, 0).contiguous()  # (N, C)
+
+        return sampled
+
     def forward(self, world_pos: torch.Tensor) -> torch.Tensor:
         """Forward pass - sample features at world positions."""
         return self.sample(world_pos)

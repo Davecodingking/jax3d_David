@@ -359,7 +359,130 @@ class HybridTextureMLP(nn.Module):
                 x = torch.cat([tex_feat, viewdirs], dim=-1)
 
         rgb = torch.sigmoid(self.mlp(x))
-        return rgb  
+        return rgb
+
+    def compute_frame_delta(self, representative_viewdir, frame_idx):
+        """
+        Precompute probe delta for a single frame (for fast inference).
+
+        Instead of computing delta for each pixel separately, we compute
+        one shared delta using a representative viewdir (e.g., center pixel).
+        This is ~100-200x faster for rendering.
+
+        Args:
+            representative_viewdir: (1, 3) or (3,) single view direction
+            frame_idx: scalar or tensor frame index
+
+        Returns:
+            delta: (1, C, R, R, R) probe delta grid for this frame
+            frame_enc: (1, 16) frame encoding for MLP input
+        """
+        if not self.use_probe_delta or self.probe_delta_conv3d is None:
+            return None, None
+
+        device = self.texture.device
+
+        # Ensure viewdir is (1, 3)
+        if representative_viewdir.dim() == 1:
+            representative_viewdir = representative_viewdir.unsqueeze(0)
+
+        # Ensure frame_idx is scalar tensor
+        if isinstance(frame_idx, (int, float)):
+            frame_idx_t = torch.tensor([frame_idx], device=device, dtype=torch.float32)
+        elif frame_idx.dim() == 0:
+            frame_idx_t = frame_idx.unsqueeze(0).float()
+        else:
+            frame_idx_t = frame_idx[:1].float()
+
+        # Compute frame encoding
+        frame_norm = frame_idx_t / self.probe_delta_period
+        frame_enc_raw = positional_encoding(frame_norm, self.frame_enc_freqs)
+        if frame_enc_raw.shape[1] < 16:
+            padding = torch.zeros(1, 16 - frame_enc_raw.shape[1], device=device)
+            frame_enc = torch.cat([frame_enc_raw, padding], dim=-1)
+        else:
+            frame_enc = frame_enc_raw[:, :16]
+
+        # Compute view encoding
+        view_enc_raw = positional_encoding(representative_viewdir, self.view_enc_freqs)
+        if view_enc_raw.shape[1] < 16:
+            padding = torch.zeros(1, 16 - view_enc_raw.shape[1], device=device)
+            view_enc = torch.cat([view_enc_raw, padding], dim=-1)
+        else:
+            view_enc = view_enc_raw[:, :16]
+
+        # Concatenate encodings
+        total_enc = torch.cat([view_enc, frame_enc], dim=-1)  # (1, 32)
+
+        # Broadcast to 3D grid
+        r = self.probe_resolution
+        enc_3d = total_enc.view(1, self.total_enc_dim, 1, 1, 1).expand(
+            1, self.total_enc_dim, r, r, r
+        )
+
+        # Compute delta (single Conv3D call!)
+        probe_grid = self.light_probe.grid  # (1, C, R, R, R)
+        conv_input = torch.cat([probe_grid, enc_3d], dim=1)
+        delta = self.probe_delta_conv3d(conv_input) * self.probe_delta_scale
+
+        return delta, frame_enc
+
+    def forward_with_precomputed_delta(self, uv, viewdirs, world_pos, precomputed_delta, precomputed_frame_enc):
+        """
+        Fast forward pass using precomputed probe delta.
+
+        This skips the expensive per-pixel Conv3D computation by using
+        a shared delta for all pixels in a frame.
+
+        Args:
+            uv: (N, 2) UV coordinates in [-1, 1]
+            viewdirs: (N, 3) view directions
+            world_pos: (N, 3) world positions
+            precomputed_delta: (1, C, R, R, R) from compute_frame_delta
+            precomputed_frame_enc: (1, 16) from compute_frame_delta
+
+        Returns:
+            (N, 3) RGB colors
+        """
+        n = uv.shape[0]
+        device = uv.device
+
+        # Sample texture (same as forward)
+        grid = uv.view(1, n, 1, 2)
+        tex_feat = F.grid_sample(
+            self.texture, grid, mode="bilinear",
+            padding_mode="border", align_corners=True
+        )
+        tex_feat = tex_feat.squeeze(0).squeeze(-1).permute(1, 0).contiguous()
+
+        # Sample probe with precomputed delta
+        if self.use_light_probe and self.light_probe is not None and precomputed_delta is not None:
+            # Expand delta to batch size for sampling
+            # Note: sample_with_delta expects (N, C, R, R, R) but we have (1, C, R, R, R)
+            # We use a modified sampling that broadcasts the single delta
+            probe_feat = self.light_probe.sample_with_shared_delta(world_pos, precomputed_delta)
+        elif self.use_light_probe and self.light_probe is not None:
+            probe_feat = self.light_probe(world_pos)
+        else:
+            probe_feat = None
+
+        # Expand frame_enc to batch size
+        frame_enc = precomputed_frame_enc.expand(n, -1) if precomputed_frame_enc is not None else None
+
+        # Build MLP input
+        if self.use_light_probe and probe_feat is not None:
+            if frame_enc is not None:
+                x = torch.cat([tex_feat, probe_feat, viewdirs, frame_enc], dim=-1)
+            else:
+                x = torch.cat([tex_feat, probe_feat, viewdirs], dim=-1)
+        else:
+            if frame_enc is not None:
+                x = torch.cat([tex_feat, viewdirs, frame_enc], dim=-1)
+            else:
+                x = torch.cat([tex_feat, viewdirs], dim=-1)
+
+        rgb = torch.sigmoid(self.mlp(x))
+        return rgb
 
 
 def export_mobilenerf_assets(model, texture_size, export_dir, mesh_path=None):
